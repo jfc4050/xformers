@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 #include "predicated_tile_access_iterator_residual_last.h"
 #include "predicated_tile_iterator_residual_last.h"
 

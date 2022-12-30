@@ -18,6 +18,7 @@
 #include "cutlass/fast_math.h"
 #include "cutlass/functional.h"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/half.h"
 #include "cutlass/layout/matrix.h"
 #include "cutlass/layout/vector.h"
 #include "cutlass/numeric_conversion.h"
@@ -153,14 +154,22 @@ template <
     // which arch we target (eg `cutlass::arch::Sm80`)
     typename ArchTag_,
     // input/output type
-    typename scalar_t_,
+    typename scalar_t__,
     // run optimized kernel because memory accesses will be aligned
     bool kIsAligned_,
     // use dropout if enabled
     bool kApplyDropout,
     // upperbound on `max(value.shape[-1], query.shape[-1])`
-    int kMaxK = std::numeric_limits<int>::max()>
+    int kMaxK_ = std::numeric_limits<int>::max()>
 struct AttentionBackwardKernel {
+  // TODO. hack for avoiding compiling versions that won't work
+  // using scalar_t_ = cutlass::half_t;
+  using scalar_t_ = typename cutlass::platform::conditional<
+      cutlass::sizeof_bits<scalar_t__>::value <= 16,
+      scalar_t__,
+      cutlass::half_t>::type;
+  static constexpr int kMaxK = cutlass::const_min(kMaxK_, 128);
+
   using scalar_t = scalar_t_;
   using output_t = scalar_t;
   using output_accum_t = float;
@@ -385,6 +394,7 @@ struct AttentionBackwardKernel {
   static constexpr bool kPrologueDOV = kPreloadMmas;
   static constexpr bool kPrologueGQ = kPreloadMmas;
   static constexpr bool kPrologueGK = kPreloadMmas;
+  static constexpr bool kReuseDOi = kIsHalf && kMaxK <= 128;
 
   // Block J
   static constexpr int64_t kBlockSizeJ = kPreloadMmas && kMaxK > 64 ? 128 : 64;
@@ -530,14 +540,21 @@ struct AttentionBackwardKernel {
     //   same time.
     // if no dropout:
     //   for computing dVj += Pij.T @ dOi
+    using WarpIteratorA = typename cutlass::gemm::threadblock::DefaultWarpIteratorAFromSharedMemory<
+        typename DefaultGemm::Mma::Operator::Shape,  // WarpShape
+        typename DefaultGemm::Mma::Operator::InstructionShape,  // InstructionShape
+        typename DefaultGemm::Mma::Operator::IteratorA,  // RegularWarpIterator
+        typename DefaultGemm::Mma::Policy  // Policy
+    >::WarpIterator; 
     using DefaultMmaFromSmem =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            typename MatmulQK::AccumulatorSharedStorage,
-            kApplyDropout>; // kScaleOperandA
+            MatmulQK::AccumulatorSharedStorage::Shape::kN,
+            WarpIteratorA,
+            kApplyDropout,  // kScaleOperandA
+            kReuseDOi>;  // kForceSmemHoldEntireB
 
     using Mma = typename DefaultMmaFromSmem::Mma;
-    using WarpIteratorA = typename DefaultMmaFromSmem::WarpIteratorA;
     using IteratorB = typename Mma::IteratorB;
     using WarpCount = typename Mma::WarpCount;
 
@@ -588,16 +605,32 @@ struct AttentionBackwardKernel {
         typename GemmType::InstructionShape,
         BiasGradEpilogueOutputOp, // EpilogueOutputOp
         void, // ThreadblockSwizzle (not used)
-        // multiple preloads, dropout Zij tile, and 3 stages push us over shared
-        // memory capacity on A100. set a ceiling on number of stages to save
-        // shared memory if dropout is in use.
-        kPreloadMmas && kApplyDropout && (kBlockSizeI * kBlockSizeJ > 64 * 64)
-            ? cutlass::const_min(2, DefaultConfig::kStages)
-            : DefaultConfig::kStages, // Stages
+        DefaultConfig::kStages, // Stages
         false, // SplitKSerial
         typename GemmType::Operator,
         cutlass::gemm::SharedMemoryClearOption::kNone>;
-    using Mma = typename MakeCustomMma<typename DefaultGemm::Mma, kMaxK>::Mma;
+
+    using Mma = typename cutlass::platform::conditional<
+        kReuseDOi,
+        // if we are reusing dOi from dVj computation, then do an MMA from shared
+        // memory where we expect the entirety of dOi to be loaded in shared memory
+        typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
+                typename DefaultGemm::Mma,  // Mma
+                kMaxK,
+                typename cutlass::gemm::threadblock::DefaultWarpIteratorAFromBSharedMemory<
+                    typename DefaultGemm::Mma::Operator::Shape,  // WarpShape
+                    typename DefaultGemm::Mma::Operator::InstructionShape,
+                    typename MatmulGradV::Mma::WarpIteratorB,  // RegularWarpIterator
+                    typename DefaultGemm::Mma::Policy
+                >::WarpIterator,
+                false, // kScaleOperandA,
+                false, // kForceSmemHoldEntireB
+                false // kTransposeA
+            >::Mma,
+        // if we don't reuse dOi from dVj computation, then do a normal MMA
+        // where dOi is reloaded from global memory
+        typename MakeCustomMma<typename DefaultGemm::Mma, kMaxK>::Mma
+    >::type;
 
     // epilogue used to write bias gradient, which is just the output of this
     // matmul with some operations applied to the fragment
@@ -606,8 +639,8 @@ struct AttentionBackwardKernel {
     // Epilogue to store to shared-memory in a format that we can use later for
     // the second matmul
     using B2bGemm = typename cutlass::gemm::threadblock::B2bGemm<
-        typename Mma::Operator::IteratorC,
-        typename Mma::Operator,
+        typename DefaultGemm::Mma::Operator::IteratorC,
+        typename DefaultGemm::Mma::Operator,
         scalar_t,
         WarpShape,
         ThreadblockShape>;
@@ -642,11 +675,18 @@ struct AttentionBackwardKernel {
         false, // SplitKSerial
         typename GemmType::Operator>;
 
+    using WarpIteratorA = typename cutlass::gemm::threadblock::DefaultWarpIteratorAFromSharedMemory<
+        typename DefaultGemm::Mma::Operator::Shape,
+        typename DefaultGemm::Mma::Operator::InstructionShape,
+        typename DefaultGemm::Mma::Operator::IteratorA,
+        typename DefaultGemm::Mma::Policy>::WarpIterator;
     using DefaultMmaFromSmem =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            typename MatmulDOIVJ::AccumulatorSharedStorage,
-            false>; // kScaleOperandA
+            MatmulDOIVJ::AccumulatorSharedStorage::Shape::kN,
+            WarpIteratorA,
+            false,  // kScaleOperandA
+            false>; // kForceSmemHoldEntireB
     using Mma = typename DefaultMmaFromSmem::Mma;
     using IteratorB = typename Mma::IteratorB;
     using WarpCount = typename Mma::WarpCount;
@@ -687,16 +727,25 @@ struct AttentionBackwardKernel {
         false, // SplitKSerial
         typename GemmType::Operator>;
 
+    using WarpIteratorA = typename cutlass::gemm::threadblock::DefaultWarpIteratorAFromSharedMemory<
+        typename DefaultGemm::Mma::Operator::Shape,
+        typename DefaultGemm::Mma::Operator::InstructionShape,
+        typename DefaultGemm::Mma::Operator::IteratorA,
+        typename DefaultGemm::Mma::Policy>::WarpIterator;
     using DefaultMmaFromSmemN =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            typename MatmulQK::AccumulatorSharedStorage,
-            false>; // kScaleOperandA
+            MatmulQK::AccumulatorSharedStorage::Shape::kN, // kMaxK
+            WarpIteratorA,
+            false,  // kScaleOperandA
+            false>; // kForceSmemHoldEntireB
     using DefaultMmaFromSmemT =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            typename MatmulDOIVJ::AccumulatorSharedStorage,
+            MatmulDOIVJ::AccumulatorSharedStorage::Shape::kM,  // kMaxK
+            WarpIteratorA,
             false, // kScaleOperandA
+            false, // kForceSmemHoldEntireB
             kPreloadMmas>; // kTransposeA
     using DefaultMmaFromSmem = typename cutlass::platform::conditional<
         DefaultMmaFromSmemT::kIsTransposedA,
@@ -764,7 +813,8 @@ struct AttentionBackwardKernel {
         ZijSharedStorage zij;
 
         union {
-          // 2. prologue for dVj
+          // has shape (n_queries_block, head_dim)
+          // 2. prologue for dVj (preload dOi)
           // 6. workspace for dVj += (Pij.T * Zij) @ dOi
           typename MatmulGradV::Mma::SharedStorage mm_gradV;
           // 7. dVj epilogue
@@ -790,7 +840,6 @@ struct AttentionBackwardKernel {
           typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
           typename MatmulGradQ::DefaultEpilogue::SharedStorage gradQ_epilogue;
         };
-
       } p2;
 
       struct {
@@ -841,6 +890,10 @@ struct AttentionBackwardKernel {
       printf("    gradQ_epilogue: %db\n", FSZ(p2.gradQ_epilogue));
       printf("  p3: %db\n", FSZ(p3));
       printf("    tmpT_shared_storage: %db\n", FSZ(p3.tmpT_shared_storage));
+      printf("    tmp_shared_storage: %db\n", FSZ(p3.tmp_shared_storage));
+      printf("    mm_gradK: %db\n", FSZ(p3.mm_gradK));
+      printf("    gradQ_epilogue_lastIter: %db\n", FSZ(p3.gradQ_epilogue_lastIter));
+      printf("    gradK_epilogue: %db\n", FSZ(p3.gradK_epilogue));
       printf("  p4: %db\n", FSZ(p4));
       printf("    mm_qk_q: %db\n", FSZ(p4.mm_qk_q));
       printf("    gradK_epilogue_final: %db\n", FSZ(p4.gradK_epilogue_final));
@@ -885,7 +938,7 @@ struct AttentionBackwardKernel {
       } p1;
 
       struct {
-        // p2 - compute gradV
+        // p2 - compute dVj and dPij_dropped = dOi @ Vj.T
         union {
           // 1. efficient load of bias tile Bij, which is then applied to Pij
           typename MatmulQK::BiasLoader::SmemTile bias;
@@ -901,28 +954,21 @@ struct AttentionBackwardKernel {
         // - later to compute dPij = (dOi @ Vj.T) * Zij
         ZijSharedStorage zij;
 
+        // 4. load (all of) dOi. needed:
+        // - in this step: dVj += (Pij.T * Zij.T) @ dOi
+        // - later step: dPij_dropped = dOi @ Vj.T
+        typename MatmulGradV::Mma::SharedStorage mm_gradV;
         union {
-          typename MatmulGradV::Mma::SharedStorage mm_gradV;
+          // 5. efficient write of dVj to global memory
           typename MatmulGradV::DefaultEpilogue::SharedStorage gradV_epilogue;
+          // 6. staging memory for loading Vj during dOi @ Vj
+          typename MatmulDOIVJ::Mma::SharedStorage mm_doivj;
         };
       } p2;
 
       struct {
-        // p3 - DO.V matmul
-        union {
-          // first compute dPij = (dOi @ Vj.T) * Zij
-          // and dSij = Pij * (dPij - Di)
-          struct {
-            // (from p2) - Pij for computing dSij = Pij * (dPij - Di)
-            typename MatmulQK::AccumulatorSharedStorage attn_shared_storage;
-            // (from p2) - Zij for computing dPij = dPij_dropped * Zij
-            ZijSharedStorage zij;
-            // matmul to compute dOiVj
-            typename MatmulDOIVJ::Mma::SharedStorage mm_doivj;
-          };
-          // then store dB = dSij to global memory
-          typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
-        };
+        // for efficient store of dB = dSij to global memory
+        typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
       } p3;
 
       struct {
@@ -982,7 +1028,7 @@ struct AttentionBackwardKernel {
     FIELD(p2, zij)
     FIELD(p2, mm_gradV)
     FIELD(p2, gradV_epilogue)
-    FIELD(p3, mm_doivj)
+    FIELD(p2, mm_doivj)
     FIELD(p3, gradB_epilogue)
     FIELD(p4, tmpT_shared_storage)
     FIELD(p4, tmp_shared_storage)
@@ -1204,12 +1250,6 @@ struct AttentionBackwardKernel {
           num_queries_in_block);
     };
     auto prologueDOV = [&]() {
-      typename MatmulDOIVJ::Mma::IteratorA iterator_A(
-          {int32_t(p.gO_strideM)},
-          p.grad_output_ptr + query_start * p.gO_strideM,
-          {num_queries_in_block, p.head_dim_value},
-          thread_id,
-          no_offset);
       typename MatmulDOIVJ::Mma::IteratorB iterator_B(
           {int32_t(p.v_strideM)},
           p.value_ptr + key_start * p.v_strideM,
@@ -1218,7 +1258,6 @@ struct AttentionBackwardKernel {
           no_offset);
       MatmulDOIVJ::Mma::prologue(
           shared_storage.mm_doivj(),
-          iterator_A,
           iterator_B,
           thread_id,
           p.head_dim_value);
@@ -1426,18 +1465,26 @@ struct AttentionBackwardKernel {
           {num_queries_in_block, p.head_dim_value - col},
           thread_id,
           no_offset);
+      // PRINT_T0_L0("dVj matmul setup for col %d", col);
+      // PRINT_T0_L0("  TbShape: %s", __get_type_name<MatmulGradV::ThreadblockShape>().data);
+      // PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
+      // PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
+      // PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
+      // PRINT_T0_L0("  SmemShape: %s", __get_type_name<Mma::Base::SharedStorage::ShapeB>().data);
+      // PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
 
       // if dropout: dVj += (Pij.T * Zij) @ dOi
       // otherwise:  dVj += Pij.T @ dOi
       Mma mma(
-          shared_storage.mm_gradV(),
-          // operand A: Pij
-          typename MatmulGradV::WarpIteratorA(
-              shared_storage.attn_shared_storage().accum_ref(), lane_id),
-          // if we're using dropout, operand A is Pij_dropped = Pij * Zij
-          // which is computed on the fly as fragments of Pij are loaded in
-          typename Mma::WarpIteratorAScale(
-              shared_storage.zij().accum_ref(), lane_id),
+          // operand A: Pij.T
+          shared_storage.attn_shared_storage().accum_ref(),
+          // operand A_scale Zij.T:
+          // if we're using dropout, operand A is Pij_dropped.T = Pij.T * Zij.T
+          // which is computed on the fly as fragments of Pij.T are loaded in
+          shared_storage.zij().accum_ref(),
+          // operand B: dOi - which was loaded into shared memory previously
+          // when we computed dVj
+          shared_storage.mm_gradV().operand_B_ref(),
           thread_id,
           warp_id,
           lane_id);
@@ -1488,14 +1535,6 @@ struct AttentionBackwardKernel {
     /////////////////////////////////////////////////////////////////////////////////////////////////
     {
       using Mma = typename MatmulDOIVJ::Mma;
-      // do_i
-      typename Mma::IteratorA iterator_A(
-          {int32_t(p.gO_strideM)},
-          p.grad_output_ptr + query_start * p.gO_strideM,
-          {num_queries_in_block, p.head_dim_value},
-          thread_id,
-          no_offset);
-
       // v_j.transpose(-2, -1)
       typename Mma::IteratorB iterator_B(
           {int32_t(p.v_strideM)},
@@ -1504,9 +1543,23 @@ struct AttentionBackwardKernel {
           thread_id,
           no_offset);
 
-      Mma mma(shared_storage.mm_doivj(), thread_id, warp_id, lane_id);
+      // PRINT_T0_L0("dOi before use in dOi @ Vj");
+      // print_tensor_ref(shared_storage.mm_gradV().operand_B_ref(), num_queries_in_block, p.head_dim);
+
+      // PRINT_T0_L0("dOi @ Vj matmul setup");
+      // PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
+      // PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
+      // PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
+      // PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
+      Mma mma(
+          // holds dOi (loaded during dVj matmul)
+          shared_storage.mm_gradV().operand_B_ref(),
+          // used for loading tiles of Vj to shared memory
+          shared_storage.mm_doivj().operand_B_ref(),
+          thread_id,
+          warp_id,
+          lane_id);
       mma.set_prologue_done(kPrologueDOV);
-      mma.set_zero_outside_bounds(!skipBoundsChecks);
 
       typename Mma::FragmentC accum;
 
@@ -1515,8 +1568,17 @@ struct AttentionBackwardKernel {
       auto gemm_k_iterations =
           (p.head_dim_value + Mma::Shape::kK - 1) / Mma::Shape::kK;
 
+      // PRINT_T0_L0("mma specs:");
+      // PRINT_T0_L0("Shape::kK: %d", Mma::Base::Shape::kK);
+      // PRINT_T0_L0("kStages: %d", Mma::Base::kStages);
+      // PRINT_T0_L0("Shmem: %s", __get_type_name<decltype(shared_storage.mm_gradV().operand_B_ref())>().data);
+
+      // PRINT_T0_L0("WarpIter: %s", __get_type_name<typename Mma::WarpIteratorA>().data);
+      // PRINT_T0_L0("WarpIter::InstructionShape: %s", __get_type_name<typename Mma::WarpIteratorA::InstructionShape>().data);
+      // PRINT_T0_L0("WarpIter::InstructionCount: %s", __get_type_name<typename Mma::WarpIteratorA::InstructionCount>().data);
+
       // Compute threadblock-scoped matrix multiply-add
-      mma(gemm_k_iterations, accum, iterator_A, iterator_B, accum);
+      mma(gemm_k_iterations, accum, iterator_B, accum);
       __syncthreads();
       if (kPrologueGQ) {
         prologueGradQ(0);
@@ -1658,14 +1720,14 @@ struct AttentionBackwardKernel {
           thread_id,
           no_offset);
 
-      auto a = shared_storage.tmp_shared_storage().accum_ref();
       Mma mma(
-          shared_storage.mm_gradQ(),
-          shared_storage.tmp_shared_storage(),
+          // operand A: dSij
+          shared_storage.tmp_shared_storage().accum_ref(),
+          // operand B: Kj
+          shared_storage.mm_gradQ().operand_B_ref(),
           thread_id,
           warp_id,
-          lane_id,
-          problem_size.k());
+          lane_id);
 
       typename Mma::FragmentC accum;
 
@@ -1759,12 +1821,13 @@ struct AttentionBackwardKernel {
           decltype(getTmp),
           decltype(getTmpT)>::apply(getTmp, getTmpT, 0);
       Mma mma(
-          shared_storage.mm_gradK(),
-          opA,
+          // operand A: dSij.T
+          opA.accum_ref(),
+          // operand B: Qi
+          shared_storage.mm_gradK().operand_B_ref(),
           thread_id,
           warp_id,
-          lane_id,
-          problem_size.k());
+          lane_id);
 
       int storage_id = col / MatmulGradK::ThreadblockShape::kN;
       AccumTileGmem gmem_tile{
