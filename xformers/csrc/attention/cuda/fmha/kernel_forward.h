@@ -375,10 +375,16 @@ struct AttentionKernel {
         false, // SplitKSerial
         typename GemmType::Operator>;
 
+    using WarpIteratorA = typename cutlass::gemm::threadblock::DefaultWarpIteratorAFromSharedMemory<
+        typename DefaultGemm::Mma::Policy::Operator::Shape,  // WarpShape
+        typename DefaultGemm::Mma::Policy::Operator::InstructionShape,
+        typename DefaultGemm::Mma::Policy::Operator::IteratorA,
+        typename DefaultGemm::Mma::Policy>::WarpIterator;
     using DefaultMmaFromSmem =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            typename MM0::AccumulatorSharedStorage,
+            MM0::AccumulatorSharedStorage::Shape::kN,  // kMaxK
+            WarpIteratorA,
             false>; // kScaleOperandA
     using Mma = typename DefaultMmaFromSmem::Mma;
     using IteratorB = typename Mma::IteratorB;
@@ -396,10 +402,6 @@ struct AttentionKernel {
         typename cutlass::epilogue::threadblock::PredicatedTileIterator<
             typename DefaultEpilogue::OutputTileIterator::ThreadMap,
             output_accum_t>;
-
-    struct SharedStorageMM1 {
-      typename Mma::SharedStorage mm;
-    };
   };
 
   static constexpr int64_t kAlignmentQ = MM0::kAlignmentA;
@@ -420,7 +422,7 @@ struct AttentionKernel {
         typename MM0::BiasLoader::SmemTile bias;
         typename MM0::AccumulatorSharedStorage si;
       };
-      typename MM1::SharedStorageMM1 mm1;
+      typename MM1::Mma::SharedStorage mm1;
     };
 
     union {
@@ -442,7 +444,7 @@ struct AttentionKernel {
         typename MM0::BiasLoader::SmemTile bias;
         typename MM0::AccumulatorSharedStorage si;
       };
-      typename MM1::SharedStorageMM1 mm1;
+      typename MM1::Mma::SharedStorage mm1;
       typename MM1::DefaultEpilogue::SharedStorage epilogue;
     };
 
@@ -549,6 +551,7 @@ struct AttentionKernel {
     // Iterate through keys
     for (int32_t iter_key_start = 0; iter_key_start < p.num_keys;
          iter_key_start += kKeysPerBlock) {
+
       int32_t problem_size_0_m =
           cutlass::fast_min((int32_t)kQueriesPerBlock, p.num_queries);
       int32_t problem_size_0_n = cutlass::fast_min(
@@ -565,7 +568,7 @@ struct AttentionKernel {
             thread_id(),
             cutlass::MatrixCoord{0, blockN * MM1::Mma::Shape::kN});
         MM1::Mma::prologue(
-            shared_storage.after_mm0.mm1.mm,
+            shared_storage.after_mm0.mm1,
             iterator_V,
             thread_id(),
             problem_size_1_k);
@@ -818,16 +821,19 @@ struct AttentionKernel {
             thread_id(),
             cutlass::MatrixCoord{0, blockN * MM1::Mma::Shape::kN});
         typename MM1::Mma mma_pv(
-            shared_storage.after_mm0.mm1.mm,
-            shared_storage.after_mm0.si,
+            // operand A: Pij_dropped in shared memory
+            shared_storage.after_mm0.si.accum_ref(),
+            // operand B: shared memory staging area for Vj, which is loaded
+            // from global memory
+            shared_storage.after_mm0.mm1.operand_B_ref(),
             (int)thread_id(),
             (int)warp_id(),
-            (int)lane_id(),
-            (int)problem_size_1_k);
+            (int)lane_id());
         mma_pv.set_prologue_done(kPreloadV);
         if (!kKeepOutputInRF) {
           accum_o.clear();
         }
+
         mma_pv(gemm_k_iterations, accum_o, iterator_V, accum_o);
         __syncthreads();
 

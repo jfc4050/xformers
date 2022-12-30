@@ -2,6 +2,7 @@
 #include <float.h>
 #include <stdio.h>
 #include <cmath>
+#include "cutlass/numeric_conversion.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Debugging functions
@@ -17,7 +18,7 @@
 
 // Print on the first thread of the first block
 #if 1
-#define PRINT_WARP_ID 0
+#define PRINT_WARP_ID 1
 #define PRINT_LANE_ID 0
 #define PRINT_T0_L0(msg, ...)                                         \
   if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&        \
@@ -25,6 +26,14 @@
       threadIdx.z == 0) {                                             \
     printf(msg "\n", ##__VA_ARGS__);                                  \
   }
+
+#define PRINT_TN_LN(warp_id, lane_id, msg, ...)                                         \
+  if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&        \
+      threadIdx.x == lane_id && threadIdx.y == warp_id && \
+      threadIdx.z == 0) {                                             \
+    printf("[warpid=%d, laneid=%d] " msg "\n", warp_id, lane_id, ##__VA_ARGS__);                                  \
+  }
+
 #define PRINT_TX_LX(msg, ...)                                                 \
   for (int bx = 0; bx < gridDim.x; ++bx) {                                    \
     for (int by = 0; by < gridDim.y; ++by) {                                  \
@@ -155,3 +164,52 @@ constexpr __string_view __get_type_name() {
       int(ps.m()),                              \
       int(ps.n()),                              \
       int(ps.k()))
+
+
+CUTLASS_DEVICE bool is_t0_l0() {
+  return blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && 
+    threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0;
+}
+
+template<typename TensorRef> 
+CUTLASS_DEVICE void print_tensor_ref(TensorRef ref, int m, int n) {
+  __syncthreads();
+  if (is_t0_l0()) {
+    cutlass::NumericConverter<float, typename TensorRef::Element> converter{};
+    for (int i = 0; i < m; ++i) {
+      for (int j = 0; j < n; ++j) {
+        printf("%.3f ", converter(ref.at({i, j})));
+      }
+      printf("\n");
+    }
+  }
+}
+
+template<typename TensorRef>
+CUTLASS_DEVICE void print_tensor_ref_layout(TensorRef ref, int m, int n) {
+  __syncthreads();
+  if (is_t0_l0()) {
+    cutlass::NumericConverter<float, typename TensorRef::Element> converter{};
+
+    typename TensorRef::Element* data = ref.data();
+
+    for (int i = 0; i < m; ++i) {
+      for (int j = 0; j < n; ++j) {
+        printf("%.3f ", converter(data[i * m + j]));
+      }
+      printf("\n");
+    }
+  }
+}
+
+
+template<typename Array>
+CUTLASS_DEVICE void print_array(Array array) {
+  cutlass::NumericConverter<float, typename Array::Element> converter{};
+  if (is_t0_l0()) {
+    for (int i = 0; i < Array::kElements; ++i) {
+      printf("%.3f \n", converter(array[i]));
+    }
+    printf("\n");
+  }
+}
