@@ -135,7 +135,7 @@ template <
     /// Size of the Gemm problem - concept: gemm::GemmShape<>
     typename Shape_,
     // Maximum value for K
-    int kMaxK,
+    int kMaxK_,
     /// Policy describing tuning details (concept: MmaPolicy)
     typename Policy_,
     /// Number of stages,
@@ -148,6 +148,7 @@ class MmaBaseFromSharedMemory {
  public:
   ///< Size of the Gemm problem - concept: gemm::GemmShape<>
   using Shape = Shape_;
+  static constexpr int kMaxK = kMaxK_;
 
   ///< Policy describing tuning details
   using Policy = Policy_;
@@ -629,9 +630,10 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
         bool hasNext = true;
 
         if (warp_mma_k == Base::kWarpGemmIterations - 1) {
-          // Write fragments to shared memory
-          this->smem_iterator_B_.store(transform_B(tb_frag_B));
-
+          if (gemm_k_iterations > 1) {
+            // Write fragments to shared memory
+            this->smem_iterator_B_.store(transform_B(tb_frag_B));
+          }
           __syncthreads();
 
           ++this->smem_iterator_B_;

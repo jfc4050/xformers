@@ -18,7 +18,7 @@
 
 // Print on the first thread of the first block
 #if 1
-#define PRINT_WARP_ID 1
+#define PRINT_WARP_ID 0
 #define PRINT_LANE_ID 0
 #define PRINT_T0_L0(msg, ...)                                         \
   if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&        \

@@ -922,7 +922,7 @@ struct AttentionBackwardKernel {
       } p1;
 
       struct {
-        // p2 - compute gradV
+        // p2 - compute dVj and dPij_dropped = dOi @ Vj.T
         union {
           // 1. efficient load of bias tile Bij, which is then applied to Pij
           typename MatmulQK::BiasLoader::SmemTile bias;
@@ -942,30 +942,17 @@ struct AttentionBackwardKernel {
         // - in this step: dVj += (Pij.T * Zij.T) @ dOi
         // - later step: dPij_dropped = dOi @ Vj.T
         typename MatmulGradV::Mma::SharedStorage mm_gradV;
-        // 5. efficient write of dVj to global memory
-        typename MatmulGradV::DefaultEpilogue::SharedStorage gradV_epilogue;
+        union {
+          // 5. efficient write of dVj to global memory
+          typename MatmulGradV::DefaultEpilogue::SharedStorage gradV_epilogue;
+          // 6. staging memory for loading Vj during dOi @ Vj
+          typename MatmulDOIVJ::Mma::SharedStorage mm_doivj;
+        };
       } p2;
 
       struct {
-        // p3 - DO.V matmul
-        union {
-          // first compute dPij = (dOi @ Vj.T) * Zij
-          // and dSij = Pij * (dPij - Di)
-          struct {
-            // (from p2) - Pij for computing dSij = Pij * (dPij - Di)
-            typename MatmulQK::AccumulatorSharedStorage attn_shared_storage;
-            // (from p2) - Zij for computing dPij = dPij_dropped * Zij
-            ZijSharedStorage zij;
-
-            // matmul to compute dOiVj
-            // (from p2) holds dOi
-            typename MatmulGradV::Mma::SharedStorage mm_gradV;
-            // for loading in tiles of Vj
-            typename MatmulDOIVJ::Mma::SharedStorage mm_doivj;
-          };
-          // then store dB = dSij to global memory
-          typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
-        };
+        // for efficient store of dB = dSij to global memory
+        typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
       } p3;
 
       struct {
@@ -1025,7 +1012,7 @@ struct AttentionBackwardKernel {
     FIELD(p2, zij)
     FIELD(p2, mm_gradV)
     FIELD(p2, gradV_epilogue)
-    FIELD(p3, mm_doivj)
+    FIELD(p2, mm_doivj)
     FIELD(p3, gradB_epilogue)
     FIELD(p4, tmpT_shared_storage)
     FIELD(p4, tmp_shared_storage)
@@ -1462,6 +1449,11 @@ struct AttentionBackwardKernel {
           {num_queries_in_block, p.head_dim_value - col},
           thread_id,
           no_offset);
+      // PRINT_T0_L0("dVj matmul setup for col %d", col);
+      // PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
+      // PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
+      // PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
+      // PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
 
       // if dropout: dVj += (Pij.T * Zij) @ dOi
       // otherwise:  dVj += Pij.T @ dOi
@@ -1533,6 +1525,14 @@ struct AttentionBackwardKernel {
           thread_id,
           no_offset);
 
+      // PRINT_T0_L0("dOi before use in dOi @ Vj");
+      // print_tensor_ref(shared_storage.mm_gradV().operand_B_ref(), num_queries_in_block, p.head_dim);
+
+      // PRINT_T0_L0("dOi @ Vj matmul setup");
+      // PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
+      // PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
+      // PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
+      // PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
       Mma mma(
           // holds dOi (loaded during dVj matmul)
           shared_storage.mm_gradV().operand_B_ref(),
