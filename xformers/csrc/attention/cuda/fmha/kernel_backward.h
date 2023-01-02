@@ -600,12 +600,7 @@ struct AttentionBackwardKernel {
         typename GemmType::InstructionShape,
         BiasGradEpilogueOutputOp, // EpilogueOutputOp
         void, // ThreadblockSwizzle (not used)
-        // multiple preloads, dropout Zij tile, and 3 stages push us over shared
-        // memory capacity on A100. set a ceiling on number of stages to save
-        // shared memory if dropout is in use.
-        kPreloadMmas && kApplyDropout && (kBlockSizeI * kBlockSizeJ > 64 * 64)
-            ? cutlass::const_min(2, DefaultConfig::kStages)
-            : DefaultConfig::kStages, // Stages
+        DefaultConfig::kStages, // Stages
         false, // SplitKSerial
         typename GemmType::Operator,
         cutlass::gemm::SharedMemoryClearOption::kNone>;
