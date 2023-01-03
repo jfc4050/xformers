@@ -118,7 +118,7 @@ def assert_allclose(
         f"{msg}: "
         f"out={out.flatten()[max_pos]} and ref={ref.flatten()[max_pos]} (diff={flatten_diff[max_pos]} > 0)"
         f"/ atol={atol}, rtol={rtol}"
-        f"total failing elements: {num_different}, percentage={percentage}"
+        f"/ total failing elements: {num_different}, percentage={percentage}"
     )
     if not passed:
         # print("out")
@@ -127,8 +127,8 @@ def assert_allclose(
         # print("ref")
         # print(ref.squeeze())
 
-        print("diff")
-        print((out - ref).abs().squeeze())
+        # print("diff")
+        # print((out - ref).abs().squeeze())
 
         print(errmsg)
 
@@ -139,13 +139,13 @@ def assert_allclose(
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_attn(dtype, dropout_p):
     batch_sz = 1
-    n_queries = 248
+    n_queries = 128
     # n_queries = 32
     n_keys = 8
     # n_keys = 1024
     n_heads = 1
     # head_dim = 24
-    head_dim = 24
+    head_dim = 128
     seed = 10
     use_bias = False
 
@@ -299,7 +299,7 @@ def run_once():
     n_queries = 1024
     n_keys = 1024
     n_heads = 64
-    head_dim = 128
+    head_dim = 64
     dtype = torch.float16
     dropout_p = 0.5
 
