@@ -236,7 +236,7 @@ def test_attn(dtype, dropout_p):
     #     batch_sz * n_queries * n_heads * head_dim,
     #     dtype=dtype,
     #     device="cuda").reshape(batch_sz, n_queries, n_heads, head_dim).contiguous() / 100
-    grad_out = torch.ones(batch_sz, n_queries, n_heads, head_dim, dtype=dtype, device="cuda")
+    grad_out = torch.randn(batch_sz, n_queries, n_heads, head_dim, dtype=dtype, device="cuda")
 
     res.backward(grad_out, retain_graph=True)
     q_grad = query.grad
