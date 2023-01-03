@@ -163,7 +163,11 @@ template <
     int kMaxK_ = std::numeric_limits<int>::max()>
 struct AttentionBackwardKernel {
   // TODO. hack for avoiding compiling versions that won't work
-  using scalar_t_ = cutlass::half_t;
+  // using scalar_t_ = cutlass::half_t;
+  using scalar_t_ = typename cutlass::platform::conditional<
+      cutlass::sizeof_bits<scalar_t__>::value <= 16,
+      scalar_t__,
+      cutlass::half_t>::type;
   static constexpr int kMaxK = cutlass::const_min(kMaxK_, 128);
 
   using scalar_t = scalar_t_;
