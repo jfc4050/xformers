@@ -735,14 +735,14 @@ struct AttentionBackwardKernel {
     using DefaultMmaFromSmemN =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            MatmulQK::AccumulatorSharedStorage::Shape::kN,
+            MatmulQK::AccumulatorSharedStorage::Shape::kN, // kMaxK
             WarpIteratorA,
             false,  // kScaleOperandA
             false>; // kForceSmemHoldEntireB
     using DefaultMmaFromSmemT =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
-            MatmulDOIVJ::AccumulatorSharedStorage::Shape::kM,
+            MatmulDOIVJ::AccumulatorSharedStorage::Shape::kM,  // kMaxK
             WarpIteratorA,
             false, // kScaleOperandA
             false, // kForceSmemHoldEntireB
@@ -942,7 +942,7 @@ struct AttentionBackwardKernel {
         // - later to compute dPij = (dOi @ Vj.T) * Zij
         ZijSharedStorage zij;
 
-        // 4. load dOi for . needed:
+        // 4. load (all of) dOi. needed:
         // - in this step: dVj += (Pij.T * Zij.T) @ dOi
         // - later step: dPij_dropped = dOi @ Vj.T
         typename MatmulGradV::Mma::SharedStorage mm_gradV;
