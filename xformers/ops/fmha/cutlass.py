@@ -214,7 +214,7 @@ class BwOp(AttentionBwOpBase):
         # TODO. optimized version currently doesn't support anything but half dtypes
         # with k <= 128
         bits_per_scalar = torch.finfo(d.query.dtype).bits
-        if bits_per_scalar != 16 or d.query.shape[-1] > 128:
+        if bits_per_scalar != 16 or d.query.shape[-1] > 128 or d.value.shape[-1] > 128:
             return False
 
         return True
