@@ -139,9 +139,9 @@ def assert_allclose(
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_attn(dtype, dropout_p):
     batch_sz = 1
-    n_queries = 128
+    n_queries = 512
     # n_queries = 32
-    n_keys = 8
+    n_keys = 512
     # n_keys = 1024
     n_heads = 1
     # head_dim = 24
@@ -231,11 +231,12 @@ def test_attn(dtype, dropout_p):
 
     assert assert_allclose(res, res_ref, msg="fwd")
 
-    grad_out = torch.arange(
-        0,
-        batch_sz * n_queries * n_heads * head_dim,
-        dtype=dtype,
-        device="cuda").reshape(batch_sz, n_queries, n_heads, head_dim).contiguous() / 100
+    # grad_out = torch.arange(
+    #     0,
+    #     batch_sz * n_queries * n_heads * head_dim,
+    #     dtype=dtype,
+    #     device="cuda").reshape(batch_sz, n_queries, n_heads, head_dim).contiguous() / 100
+    grad_out = torch.ones(batch_sz, n_queries, n_heads, head_dim, dtype=dtype, device="cuda")
 
     res.backward(grad_out, retain_graph=True)
     q_grad = query.grad
