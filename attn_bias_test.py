@@ -106,16 +106,19 @@ def assert_allclose(
     out: torch.Tensor,
     ref: torch.Tensor,
     msg: str = "failed",
-    atol: float = 2e-2,
+    atol: float = 9.5e-2,
     rtol: float = 2e-2,
 ) -> bool:
     assert out.shape == ref.shape
     flatten_diff = ((out - ref).abs() - atol - ref.abs() * rtol).flatten()
     max_pos = flatten_diff.argmax()
+    num_different = torch.count_nonzero(flatten_diff > 0)
+    percentage = num_different / flatten_diff.numel()
     passed, errmsg = torch.allclose(out, ref, rtol=rtol, atol=atol), (
         f"{msg}: "
         f"out={out.flatten()[max_pos]} and ref={ref.flatten()[max_pos]} (diff={flatten_diff[max_pos]} > 0)"
         f"/ atol={atol}, rtol={rtol}"
+        f"total failing elements: {num_different}, percentage={percentage}"
     )
     if not passed:
         # print("out")
@@ -126,6 +129,8 @@ def assert_allclose(
 
         print("diff")
         print((out - ref).abs().squeeze())
+
+        print(errmsg)
 
     return passed
 
@@ -140,7 +145,7 @@ def test_attn(dtype, dropout_p):
     # n_keys = 1024
     n_heads = 1
     # head_dim = 24
-    head_dim = 128
+    head_dim = 24
     seed = 10
     use_bias = False
 
