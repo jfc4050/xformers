@@ -385,7 +385,8 @@ struct AttentionKernel {
             typename DefaultGemm::Mma,
             MM0::AccumulatorSharedStorage::Shape::kN,  // kMaxK
             WarpIteratorA,
-            false>; // kScaleOperandA
+            false,  // kScaleOperandA
+            false>;  // kForceSmemHoldEntireB
     using Mma = typename DefaultMmaFromSmem::Mma;
     using IteratorB = typename Mma::IteratorB;
     using WarpCount = typename Mma::WarpCount;

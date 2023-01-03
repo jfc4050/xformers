@@ -547,7 +547,8 @@ struct AttentionBackwardKernel {
             typename DefaultGemm::Mma,
             MatmulQK::AccumulatorSharedStorage::Shape::kN,
             WarpIteratorA,
-            kApplyDropout>; // kScaleOperandA
+            kApplyDropout,  // kScaleOperandA
+            kReuseDOi>;  // kForceSmemHoldEntireB
 
     using Mma = typename DefaultMmaFromSmem::Mma;
     using IteratorB = typename Mma::IteratorB;
@@ -619,6 +620,7 @@ struct AttentionBackwardKernel {
                     typename DefaultGemm::Mma::Policy
                 >::WarpIterator,
                 false, // kScaleOperandA,
+                false, // kForceSmemHoldEntireB
                 false // kTransposeA
             >::Mma,
         // if we don't reuse dOi from dVj computation, then do a normal MMA
@@ -679,7 +681,8 @@ struct AttentionBackwardKernel {
             typename DefaultGemm::Mma,
             MatmulDOIVJ::AccumulatorSharedStorage::Shape::kN,
             WarpIteratorA,
-            false>; // kScaleOperandA
+            false,  // kScaleOperandA
+            false>; // kForceSmemHoldEntireB
     using Mma = typename DefaultMmaFromSmem::Mma;
     using IteratorB = typename Mma::IteratorB;
     using WarpCount = typename Mma::WarpCount;
@@ -730,13 +733,15 @@ struct AttentionBackwardKernel {
             typename DefaultGemm::Mma,
             MatmulQK::AccumulatorSharedStorage::Shape::kN,
             WarpIteratorA,
-            false>; // kScaleOperandA
+            false,  // kScaleOperandA
+            false>; // kForceSmemHoldEntireB
     using DefaultMmaFromSmemT =
         typename cutlass::gemm::threadblock::DefaultMmaFromSharedMemory<
             typename DefaultGemm::Mma,
             MatmulDOIVJ::AccumulatorSharedStorage::Shape::kM,
             WarpIteratorA,
             false, // kScaleOperandA
+            false, // kForceSmemHoldEntireB
             kPreloadMmas>; // kTransposeA
     using DefaultMmaFromSmem = typename cutlass::platform::conditional<
         DefaultMmaFromSmemT::kIsTransposedA,
@@ -1444,11 +1449,13 @@ struct AttentionBackwardKernel {
           {num_queries_in_block, p.head_dim_value - col},
           thread_id,
           no_offset);
-      // PRINT_T0_L0("dVj matmul setup for col %d", col);
-      // PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
-      // PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
-      // PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
-      // PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
+      PRINT_T0_L0("dVj matmul setup for col %d", col);
+      PRINT_T0_L0("  TbShape: %s", __get_type_name<MatmulGradV::ThreadblockShape>().data);
+      PRINT_T0_L0("  MaxK: %d", Mma::Base::kMaxK);
+      PRINT_T0_L0("  kK: %d", Mma::Base::Shape::kK);
+      PRINT_T0_L0("  kStages: %d", Mma::Base::kStages);
+      PRINT_T0_L0("  SmemShape: %s", __get_type_name<Mma::Base::SharedStorage::ShapeB>().data);
+      PRINT_T0_L0("  kSmemContainsEntireB: %d", Mma::Base::kSmemContainsEntireB);
 
       // if dropout: dVj += (Pij.T * Zij) @ dOi
       // otherwise:  dVj += Pij.T @ dOi

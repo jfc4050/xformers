@@ -142,6 +142,7 @@ template <
     int Stages,
     /// layout in shared memory of operand A
     typename SmemLayoutA,
+    bool kForceSmemHoldEntireB_,
     /// Used for partial specialization
     typename Enable = bool>
 class MmaBaseFromSharedMemory {
@@ -152,6 +153,8 @@ class MmaBaseFromSharedMemory {
 
   ///< Policy describing tuning details
   using Policy = Policy_;
+
+  static constexpr bool kForceSmemHoldEntireB = kForceSmemHoldEntireB_;
 
   //
   // Dependent types
@@ -178,7 +181,8 @@ class MmaBaseFromSharedMemory {
   static int const kWarpGemmIterations1 = kWarpGemmIterations;
 
   /// Number of stages
-  static int const kStages = Stages;
+  static int const kStages = kForceSmemHoldEntireB_ ?
+    (kMaxK + Shape::kK - 1) / Shape::kK : Stages;
 
   /// If this is true, we fill the entire shmem buffer at start
   /// and don't need to iterate through it in a circular fashion
@@ -356,6 +360,7 @@ template <
     //  (concept: ReadableTileIterator | ForwardTileIterator |
     //  MaskedTileIterator)
     typename IteratorB_,
+    bool kForceSmemHoldEntireB,
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
@@ -377,7 +382,8 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
                                          MaxK,
                                          Policy_,
                                          2,
-                                         typename WarpIteratorA_::Layout> {
+                                         typename WarpIteratorA_::Layout,
+                                         kForceSmemHoldEntireB> {
  public:
   ///< Base class
   using Base = MmaBaseFromSharedMemory<
@@ -385,7 +391,8 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
       MaxK,
       Policy_,
       2,
-      typename WarpIteratorA_::Layout>;
+      typename WarpIteratorA_::Layout,
+      kForceSmemHoldEntireB>;
 
   using Shape =
       Shape_; ///< Size of the Gemm problem - concept: gemm::GemmShape<>
@@ -432,7 +439,7 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
 
   // staticaly assert kStages for MmaPipelined is two (Double-buffered pipeline)
   static_assert(
-      (Base::kStages == 2),
+      kForceSmemHoldEntireB || (Base::kStages == 2),
       "MmaPipelined requires kStages set to value 2");
 
  private:
@@ -726,6 +733,7 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB1_,
+    bool kForceSmemHoldEntireB,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB1,
     /// Data type of accumulator matrix
@@ -740,10 +748,10 @@ template <
     /// Used for partial specialization
     typename Enable = bool>
 class MmaMultistageFromSharedMemory
-    : public MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout> {
+    : public MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout, kForceSmemHoldEntireB> {
  public:
   ///< Base class
-  using Base = MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout>;
+  using Base = MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout, kForceSmemHoldEntireB>;
 
   ///< Size of the Gemm problem - concept: gemm::GemmShape<>
   using Shape1 = Shape1_;
@@ -1433,6 +1441,7 @@ template <
     /// whether or not to apply elementwise multiplication of operand A by
     /// another matrix in shared memory before usage in A @ B
     bool kScaleOperandA,
+    bool kForceSmemHoldEntireB,
     bool kTransposeA = false>
 struct DefaultMmaFromSharedMemory;
 
@@ -1455,6 +1464,7 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
+    bool kForceSmemHoldEntireB,
     /// Data type of accumulator matrix
     typename ElementC_,
     /// Data type of accumulator matrix
@@ -1486,6 +1496,7 @@ struct DefaultMmaFromSharedMemory<
     kMaxK,
     WarpIteratorA_,
     kScaleOperandA,
+    kForceSmemHoldEntireB,
     kTransposeA> {
   static constexpr int kWarpSize = 32;
   using SmemAccumulatorLayout = cutlass::layout::RowMajor;
@@ -1518,6 +1529,7 @@ struct DefaultMmaFromSharedMemory<
       kScaleOperandA,
       kMaxK,
       IteratorB,
+      kForceSmemHoldEntireB,
       SmemIteratorB_,
       ElementC_,
       LayoutC_,
@@ -1544,6 +1556,7 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
+    bool kForceSmemHoldEntireB,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
     /// Data type of accumulator matrix
@@ -1578,6 +1591,7 @@ struct DefaultMmaFromSharedMemory<
     kMaxK,
     WarpIteratorA_,
     kScaleOperandA,
+    kForceSmemHoldEntireB,
     kTransposeA> {
   static constexpr int kWarpSize = 32;
 
@@ -1620,6 +1634,7 @@ struct DefaultMmaFromSharedMemory<
           kScaleOperandA,
           IteratorB,
           SmemIteratorB_,
+          kForceSmemHoldEntireB,
           RegularMma::kCacheOpB,
           ElementC_,
           LayoutC_,
