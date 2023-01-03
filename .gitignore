@@ -32,8 +32,13 @@ venv.bak/
 .vscode/*
 xformers/benchmarks/LRA/datasets
 xformers/benchmarks/LRA/logs
+notes/
+build.sh
 
 my_runs.md
+
+# version file
+xformers/version.py
 
 # Triton cache
 .cache
