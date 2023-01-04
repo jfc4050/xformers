@@ -805,7 +805,8 @@ struct AttentionBackwardKernel {
         ZijSharedStorage zij;
 
         union {
-          // 2. prologue for dVj
+          // has shape (n_queries_block, head_dim)
+          // 2. prologue for dVj (preload dOi)
           // 6. workspace for dVj += (Pij.T * Zij) @ dOi
           typename MatmulGradV::Mma::SharedStorage mm_gradV;
           // 7. dVj epilogue
@@ -831,7 +832,6 @@ struct AttentionBackwardKernel {
           typename MatmulDOIVJ::BiasGradEpilogue::SharedStorage gradB_epilogue;
           typename MatmulGradQ::DefaultEpilogue::SharedStorage gradQ_epilogue;
         };
-
       } p2;
 
       struct {
@@ -882,6 +882,10 @@ struct AttentionBackwardKernel {
       printf("    gradQ_epilogue: %db\n", FSZ(p2.gradQ_epilogue));
       printf("  p3: %db\n", FSZ(p3));
       printf("    tmpT_shared_storage: %db\n", FSZ(p3.tmpT_shared_storage));
+      printf("    tmp_shared_storage: %db\n", FSZ(p3.tmp_shared_storage));
+      printf("    mm_gradK: %db\n", FSZ(p3.mm_gradK));
+      printf("    gradQ_epilogue_lastIter: %db\n", FSZ(p3.gradQ_epilogue_lastIter));
+      printf("    gradK_epilogue: %db\n", FSZ(p3.gradK_epilogue));
       printf("  p4: %db\n", FSZ(p4));
       printf("    mm_qk_q: %db\n", FSZ(p4.mm_qk_q));
       printf("    gradK_epilogue_final: %db\n", FSZ(p4.gradK_epilogue_final));
