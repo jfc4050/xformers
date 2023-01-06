@@ -52,7 +52,10 @@
 #include "cutlass/matrix_shape.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/numeric_types.h"
+#include "cutlass/pitch_linear_coord.h"
 #include "cutlass/platform/platform.h"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/transform/pitch_linear_thread_map.h"
 #include "cutlass/transform/threadblock/vector_iterator.h"
 
 #include "attention_scaling_coefs_updater.h"
@@ -142,6 +145,8 @@ template <
     int Stages,
     /// layout in shared memory of operand A
     typename SmemLayoutA,
+    typename SmemLayoutB,
+    bool kPreloadedOperandB,
     bool kForceSmemHoldEntireB_,
     /// Used for partial specialization
     typename Enable = bool>
@@ -194,7 +199,7 @@ class MmaBaseFromSharedMemory {
 
   /// Tensor reference to the B operand
   using TensorRefB =
-      TensorRef<typename Operator::ElementB, typename Operator::LayoutB>;
+      TensorRef<typename Operator::ElementB, SmemLayoutB>;
 
   //
   // Nested structs
@@ -208,9 +213,13 @@ class MmaBaseFromSharedMemory {
     //
 
     /// Shape of the B matrix operand in shared memory
-    using ShapeB = MatrixShape<
-        Shape::kK * kStages + Policy::SmemPaddingB::kRow,
-        Shape::kN + Policy::SmemPaddingB::kColumn>;
+    using ShapeB = typename cutlass::platform::conditional<
+        kPreloadedOperandB,
+        MatrixShape<1, 1>,
+        MatrixShape<
+            Shape::kK * kStages + Policy::SmemPaddingB::kRow,
+            Shape::kN + Policy::SmemPaddingB::kColumn>
+    >::type;
 
    public:
     //
@@ -237,71 +246,70 @@ class MmaBaseFromSharedMemory {
       return TensorRefB{operand_B.data(), LayoutB()};
     }
   };
-
- protected:
-  //
-  // Data members
-  //
-
-  // /// Iterator to load a warp-scoped tile of A operand from shared memory
-  // typename Operator::IteratorA warp_tile_iterator_A_;
-
-  /// Iterator to load a warp-scoped tile of B operand from shared memory
-  typename Operator::IteratorB warp_tile_iterator_B_;
-
- public:
-  /// Construct from tensor references
-  CUTLASS_DEVICE
-  MmaBaseFromSharedMemory(
-      ///< Shared storage needed for internal use by threadblock-scoped GEMM
-      TensorRefB b_tile,
-      ///< ID within the threadblock
-      int thread_idx,
-      ///< ID of warp
-      int warp_idx,
-      ///< ID of each thread within a warp
-      int lane_idx)
-      : warp_tile_iterator_B_(b_tile, lane_idx) {}
 };
 
 namespace {
 
-// has necessary trait compliance with WarpIteratorFromSmem but doesn't do
+// has necessary trait compliance with normal iterators but doesn't do
 // anything, can be default initialized, and uses fragment that takes up
-// (almost) no space. this warp iterator is selected at compile time when
-// elementwise on-the-fly scaling for operand A is disabled, in which case
-// operations related to loading scale factors for operand A get wiped out by
-// the compiler.
+// (almost) no space. all its operations should get wiped out by the compiler.
 template <typename TensorRef>
-class NoOpWarpIteratorScale {
+class NoOpIterator {
  public:
+  using Element = typename TensorRef::Element;
   // in pipelined+multistage MMA implementations we keep an array of fragments.
   // if we aren't using scaling we don't want to waste registers on fragments
   // of scale elements, so ideally this would be sized 0.
   // using size 1 is kind of a hack to get around arrays of zero-sized objects
   // not being allowed. the compiler is probably smart enough to wipe it out
   // anyways.
-  using Fragment = cutlass::Array<char, 1>;
+  using Fragment = cutlass::Array<Element, 4>;
+  using AccessType = cutlass::Array<Element, 1>;
+  static constexpr int AccessSize = 4 * cutlass::sizeof_bits<Element>::value / 8;
+  using ThreadMap = cutlass::transform::PitchLinearStripminedThreadMap<
+      cutlass::PitchLinearShape<AccessSize, 1>, 1, AccessSize>;
+  static constexpr int kAccessesPerVector = 1;
+
+  CUTLASS_DEVICE
+  NoOpIterator() {}
 
   CUTLASS_HOST_DEVICE
-  NoOpWarpIteratorScale() {}
+  NoOpIterator(TensorRef const&, int) {}
 
-  CUTLASS_HOST_DEVICE
-  NoOpWarpIteratorScale(TensorRef const&, int) {}
+  CUTLASS_DEVICE
+  void load(Fragment&) const {}
 
-  CUTLASS_HOST_DEVICE
-  NoOpWarpIteratorScale& add_tile_offset(
-      typename TensorRef::TensorCoord const&) {
-    return *this;
+  CUTLASS_DEVICE
+  void store(Fragment) const {}
+
+  CUTLASS_DEVICE
+  AccessType* get() const {
+    return nullptr;
   }
 
-  CUTLASS_HOST_DEVICE
-  NoOpWarpIteratorScale& operator++() {
+  CUTLASS_DEVICE
+  NoOpIterator& add_tile_offset(typename TensorRef::TensorCoord const&) {
     return *this;
   }
 
   CUTLASS_DEVICE
-  void load(Fragment&) const {}
+  NoOpIterator& operator++() {
+    return *this;
+  }
+
+  CUTLASS_DEVICE
+  void clear_mask(bool) {}
+
+  CUTLASS_DEVICE
+  void set_residual_tile(bool) {}
+
+  CUTLASS_DEVICE
+  void set_iteration_index(int) {}
+
+  CUTLASS_DEVICE
+  bool valid() {
+    return false;
+  }
 };
 
 // if scaling is enabled, performs fragment elementwise multiplication between
@@ -360,10 +368,12 @@ template <
     //  (concept: ReadableTileIterator | ForwardTileIterator |
     //  MaskedTileIterator)
     typename IteratorB_,
-    bool kForceSmemHoldEntireB,
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
+    typename WarpIteratorB_,
+    bool kPreloadedOperandB,
+    bool kForceSmemHoldEntireB,
     /// Data type of accumulator matrix
     typename ElementC_,
     /// Data type of accumulator matrix
@@ -383,6 +393,8 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
                                          Policy_,
                                          2,
                                          typename WarpIteratorA_::Layout,
+                                         typename WarpIteratorB_::Layout,
+                                         kPreloadedOperandB,
                                          kForceSmemHoldEntireB> {
  public:
   ///< Base class
@@ -392,6 +404,8 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
       Policy_,
       2,
       typename WarpIteratorA_::Layout,
+      typename WarpIteratorB_::Layout,
+      kPreloadedOperandB,
       kForceSmemHoldEntireB>;
 
   using Shape =
@@ -400,13 +414,14 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
 
   ///< loads fragments of A from shared memory.
   using WarpIteratorA = WarpIteratorA_;
+  using WarpIteratorB = WarpIteratorB_;
 
   ///< loads fragments of A_scale from shared memory if operand A scaling is
   ///< enabled. otherwise no-op.
   using WarpIteratorAScale = typename cutlass::platform::conditional<
       ScaleOperandA,
       WarpIteratorA,
-      NoOpWarpIteratorScale<typename WarpIteratorA::TensorRef>>::type;
+      NoOpIterator<typename WarpIteratorA::TensorRef>>::type;
 
   using IteratorB =
       IteratorB_; ///< Iterates over tiles of B operand in global memory
@@ -468,6 +483,7 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
   /// Iterator to load a warp-scoped tile of A operand from intermediate
   /// accumulator tile
   WarpIteratorA warp_tile_iterator_A_;
+  WarpIteratorB warp_tile_iterator_B_;
 
   /// Iterator to load a warp-scoped tile of A_scale from intermediate
   /// accumulator tile (only used if ScaleOperandA_ is true)
@@ -483,9 +499,9 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
       int thread_idx,
       int warp_idx,
       int lane_idx)
-      : Base(b_staging, thread_idx, warp_idx, lane_idx),
-        warp_tile_iterator_A_(a, lane_idx),
+      : warp_tile_iterator_A_(a, lane_idx),
         warp_tile_iterator_A_scale_(a_scale, lane_idx),
+        warp_tile_iterator_B_(b_staging, lane_idx),
         smem_iterator_B_(b_staging, thread_idx) {
     // Compute warp location within threadblock tile by mapping the warp_id to
     // three coordinates:
@@ -514,8 +530,8 @@ class MmaPipelinedFromSharedMemory : public MmaBaseFromSharedMemory<
       int thread_idx, ///< ID within the threadblock
       int warp_idx, ///< ID of warp
       int lane_idx) ///< ID of each thread within a warp
-      : Base(b_staging, thread_idx, warp_idx, lane_idx),
-        warp_tile_iterator_A_(a, lane_idx),
+      : warp_tile_iterator_A_(a, lane_idx),
+        warp_tile_iterator_B_(b_staging, lane_idx),
         smem_iterator_B_(b_staging, thread_idx) {
     // Compute warp location within threadblock tile by mapping the warp_id to
     // three coordinates:
@@ -733,6 +749,8 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB1_,
+    typename WarpIteratorB1_,
+    bool kPreloadedOperandB,
     bool kForceSmemHoldEntireB,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB1,
@@ -747,11 +765,26 @@ template <
     int kMaxK_,
     /// Used for partial specialization
     typename Enable = bool>
-class MmaMultistageFromSharedMemory
-    : public MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout, kForceSmemHoldEntireB> {
+class MmaMultistageFromSharedMemory : public MmaBaseFromSharedMemory<
+    Shape1_,
+    kMaxK_,
+    Policy1_,
+    Stages_,
+    typename WarpIteratorA1_::Layout,
+    typename WarpIteratorB1_::Layout,
+    kPreloadedOperandB,
+    kForceSmemHoldEntireB> {
  public:
   ///< Base class
-  using Base = MmaBaseFromSharedMemory<Shape1_, kMaxK_, Policy1_, Stages_, typename WarpIteratorA1_::Layout, kForceSmemHoldEntireB>;
+  using Base = MmaBaseFromSharedMemory<
+      Shape1_,
+      kMaxK_,
+      Policy1_,
+      Stages_,
+      typename WarpIteratorA1_::Layout,
+      typename WarpIteratorB1_::Layout,
+      kPreloadedOperandB,
+      kForceSmemHoldEntireB>;
 
   ///< Size of the Gemm problem - concept: gemm::GemmShape<>
   using Shape1 = Shape1_;
@@ -764,6 +797,7 @@ class MmaMultistageFromSharedMemory
   using SmemIteratorB1 = SmemIteratorB1_;
   using WarpIteratorA1 = WarpIteratorA1_; ///< Iterates over the intermediate
                                           ///< accumulator tile in shared memory
+  using WarpIteratorB1 = WarpIteratorB1_;
   static constexpr bool ScaleOperandA = ScaleOperandA_;
 
   ///< warp level iterator over A_scale matrix tile kept in shared memory.
@@ -771,14 +805,13 @@ class MmaMultistageFromSharedMemory
   using WarpIteratorAScale = typename cutlass::platform::conditional<
       ScaleOperandA,
       WarpIteratorA1,
-      NoOpWarpIteratorScale<typename WarpIteratorA1::TensorRef>>::type;
+      NoOpIterator<typename WarpIteratorA1::TensorRef>>::type;
   ///< Data type of accumulator matrix
   using ElementC = ElementC_;
   ///< Layout of accumulator matrix
   using LayoutC = LayoutC_;
 
   static cutlass::arch::CacheOperation::Kind const kCacheOpB1 = CacheOpB1;
-  static constexpr bool kSmemContainsEntireB = Base::kSmemContainsEntireB;
 
   //
   // Dependent types
@@ -815,7 +848,7 @@ class MmaMultistageFromSharedMemory
   };
 
   static constexpr int kNumStagesConcurrentLoad =
-      kSmemContainsEntireB ? Base::kStages : Base::kStages - 1;
+      Base::kSmemContainsEntireB ? Base::kStages : Base::kStages - 1;
 
  private:
   using WarpLoadedFragmentA1 = typename Operator1::FragmentA;
@@ -841,6 +874,7 @@ class MmaMultistageFromSharedMemory
   /// Iterator to load a warp-scoped tile of A1 operand from intermediate
   /// accumulator tile
   WarpIteratorA1 warp_tile_iterator_A1_;
+  WarpIteratorB1 warp_tile_iterator_B_;
 
   /// Iterator to load a warp-scoped tile of A1_scale operand from shared memory
   /// if operand A scaling is disabled everything this does is a no-op.
@@ -862,9 +896,9 @@ class MmaMultistageFromSharedMemory
       int thread_idx,
       int warp_idx,
       int lane_idx)
-      : Base(b_tile, thread_idx, warp_idx, lane_idx),
-        warp_tile_iterator_A1_(a, lane_idx),
+      : warp_tile_iterator_A1_(a, lane_idx),
         warp_tile_iterator_A1_scale_(a, lane_idx),
+        warp_tile_iterator_B_(b_tile, lane_idx),
         smem_iterator_B1_(b_tile, thread_idx),
         prologue_done_(false) {
     // Compute warp location within threadblock tile by mapping the warp_id to
@@ -898,8 +932,8 @@ class MmaMultistageFromSharedMemory
       int warp_idx,
       ///< ID of each thread within a warp
       int lane_idx)
-      : Base(b_tile, thread_idx, warp_idx, lane_idx),
-        warp_tile_iterator_A1_(a, lane_idx),
+      : warp_tile_iterator_A1_(a, lane_idx),
+        warp_tile_iterator_B_(b_tile, lane_idx),
         smem_iterator_B1_(b_tile, thread_idx),
         prologue_done_(false) {
     // Compute warp location within threadblock tile by mapping the warp_id to
@@ -933,11 +967,13 @@ class MmaMultistageFromSharedMemory
       IteratorB iterator_B1,
       int thread_idx,
       int problem_size_0_n) {
-    SmemIteratorB1 smem_iterator_B1(shared_storage.operand_B_ref(), thread_idx);
-    _prologue(
-        iterator_B1,
-        (problem_size_0_n + Base::Shape::kK - 1) / Base::Shape::kK,
-        smem_iterator_B1);
+    if (!kPreloadedOperandB) {
+      SmemIteratorB1 smem_iterator_B1(shared_storage.operand_B_ref(), thread_idx);
+      _prologue(
+          iterator_B1,
+          (problem_size_0_n + Base::Shape::kK - 1) / Base::Shape::kK,
+          smem_iterator_B1);
+    }
   }
 
   CUTLASS_DEVICE
@@ -1043,38 +1079,40 @@ class MmaMultistageFromSharedMemory
     // Perform accumulation in the 'd' output operand
     accum = src_accum;
 
-    if (!prologue_done_) {
-      _prologue(iterator_B1, gemm_k_iterations_1_, smem_iterator_B1_);
-    } else if (!kSmemContainsEntireB) {
-      // Restore the iterators increments
+    if (!kPreloadedOperandB) {
+      if (!prologue_done_) {
+        _prologue(iterator_B1, gemm_k_iterations_1_, smem_iterator_B1_);
+      } else if (!Base::kSmemContainsEntireB) {
+        // Restore the iterators increments
 
-      int gemm_k_iterations_1 = gemm_k_iterations_1_;
-      // Issue several complete stages
-      CUTLASS_PRAGMA_UNROLL
-      for (int stage = 0; stage < kNumStagesConcurrentLoad;
-           ++stage, --gemm_k_iterations_1) {
-        iterator_B1.set_iteration_index(0);
-        this->smem_iterator_B1_.set_iteration_index(0);
-
-        // LDGSTS for operand B
+        int gemm_k_iterations_1 = gemm_k_iterations_1_;
+        // Issue several complete stages
         CUTLASS_PRAGMA_UNROLL
-        for (int j = 0; j < Detail::TBLDGSTSIterationsB1; ++j) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int v = 0; v < IteratorB1::kAccessesPerVector; ++v) {
-            ++iterator_B1;
-          }
-          ++this->smem_iterator_B1_;
-        }
-        iterator_B1.add_tile_offset({1, 0});
-        this->smem_iterator_B1_.add_tile_offset({1, 0});
-      }
-      iterator_B1.set_residual_tile(gemm_k_iterations_1 <= 1);
-      iterator_B1.clear_mask(gemm_k_iterations_1 <= 0);
-    }
+        for (int stage = 0; stage < kNumStagesConcurrentLoad;
+            ++stage, --gemm_k_iterations_1) {
+          iterator_B1.set_iteration_index(0);
+          this->smem_iterator_B1_.set_iteration_index(0);
 
-    // DEPBAR+SYNC
-    cutlass::arch::cp_async_wait<kNumStagesConcurrentLoad - 1>();
-    __syncthreads();
+          // LDGSTS for operand B
+          CUTLASS_PRAGMA_UNROLL
+          for (int j = 0; j < Detail::TBLDGSTSIterationsB1; ++j) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int v = 0; v < IteratorB1::kAccessesPerVector; ++v) {
+              ++iterator_B1;
+            }
+            ++this->smem_iterator_B1_;
+          }
+          iterator_B1.add_tile_offset({1, 0});
+          this->smem_iterator_B1_.add_tile_offset({1, 0});
+        }
+        iterator_B1.set_residual_tile(gemm_k_iterations_1 <= 1);
+        iterator_B1.clear_mask(gemm_k_iterations_1 <= 0);
+      }
+
+      // DEPBAR+SYNC
+      cutlass::arch::cp_async_wait<kNumStagesConcurrentLoad - 1>();
+      __syncthreads();
+    }
 
     // remember that WarpFragmentAScale and WarpIteratorAScale are no-op/empty
     // if scaling is disabled.
@@ -1199,7 +1237,7 @@ class MmaMultistageFromSharedMemory
 
           group_start_iteration_B1 = warp_mma_k * Detail::kAccessesPerGroupB1;
 
-          if (!kSmemContainsEntireB) {
+          if (!Base::kSmemContainsEntireB && !kPreloadedOperandB) {
             copy_tiles_and_advance_1(iterator_B1, group_start_iteration_B1);
           }
         }
@@ -1209,25 +1247,26 @@ class MmaMultistageFromSharedMemory
           group_start_iteration_B1 =
               (warp_mma_k + 1) * Detail::kAccessesPerGroupB1;
 
-          if (!kSmemContainsEntireB) {
+          if (!Base::kSmemContainsEntireB && !kPreloadedOperandB) {
             copy_tiles_and_advance_1(iterator_B1, group_start_iteration_B1);
           }
 
-          // Inserts a memory fence between stages of cp.async instructions.
-          cutlass::arch::cp_async_fence();
+          if (!kPreloadedOperandB) {
+            // Inserts a memory fence between stages of cp.async instructions.
+            cutlass::arch::cp_async_fence();
 
-          // Waits until kStages-2 stages have committed.
-          arch::cp_async_wait<kNumStagesConcurrentLoad - 1>();
-          __syncthreads();
+            // Waits until kStages-2 stages have committed.
+            arch::cp_async_wait<kNumStagesConcurrentLoad - 1>();
+            __syncthreads();
+            // Move to the next stage
+            iterator_B1.add_tile_offset({1, 0});
 
-          // Move to the next stage
-          iterator_B1.add_tile_offset({1, 0});
-
-          this->smem_iterator_B1_.add_tile_offset({1, 0});
+            this->smem_iterator_B1_.add_tile_offset({1, 0});
+          }
 
           // Add negative offsets to return iterators to the 'start' of the
           // circular buffer in shared memory
-          if (!kSmemContainsEntireB) {
+          if (!Base::kSmemContainsEntireB && !kPreloadedOperandB) {
             if (smem_write_stage_idx == (Base::kStages - 1)) {
               this->smem_iterator_B1_.add_tile_offset({-Base::kStages, 0});
               smem_write_stage_idx = 0;
@@ -1432,15 +1471,84 @@ struct DefaultWarpIteratorAFromBSharedMemory<
   using WarpIterator = RegularWarpIterator;
 };
 
+template <
+    typename WarpShape,
+    typename InstructionShape,
+    typename RegularWarpIterator,
+    typename Policy,
+    typename Enable = void>
+struct DefaultWarpIteratorBFromASharedMemory {};
+
+// TensorOp - Ampere
+template <typename WarpShape, typename WarpIteratorA, typename Policy>
+struct DefaultWarpIteratorBFromASharedMemory<
+    WarpShape,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    WarpIteratorA,
+    Policy> {
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 8>;
+  static constexpr auto kWarpSize = 32;
+  using OpDelta = typename Policy::Operator::Policy::OpDelta;
+
+  using WarpIterator =
+      cutlass::gemm::warp::MmaTensorOpMultiplicandCongruousTileAccessIterator<
+          cutlass::MatrixShape<WarpShape::kK, WarpShape::kN>,
+          cutlass::gemm::Operand::kB,
+          typename WarpIteratorA::Element,
+          typename WarpIteratorA::Layout,
+          cutlass::MatrixShape<InstructionShape::kK, InstructionShape::kN>,
+          OpDelta::kRow,
+          kWarpSize>;
+};
+
+// TensorOp - Volta
+template <typename WarpShape, typename RegularWarpIterator, typename Policy>
+struct DefaultWarpIteratorBFromASharedMemory<
+    WarpShape,
+    cutlass::gemm::GemmShape<16, 16, 4>,
+    RegularWarpIterator,
+    Policy> {
+  using InstructionShape = cutlass::gemm::GemmShape<16, 16, 4>;
+  static constexpr auto kWarpSize = 32;
+  using OpDelta = typename Policy::Operator::Policy::OpDelta;
+
+  using WarpIterator =
+      cutlass::gemm::warp::MmaVoltaTensorOpMultiplicandTileIterator<
+          cutlass::MatrixShape<32, 32>, // (WarpShape::kM, WarpShape::kK),
+          cutlass::gemm::Operand::kB,
+          typename RegularWarpIterator::Element,
+          cutlass::layout::RowMajorVoltaTensorOpMultiplicandCrosswise<16, 32>,
+          cutlass::MatrixShape<4, 16>,  // (InstructionShape::kK, InstructionShape::kN)
+          OpDelta::kRow,
+          kWarpSize>;
+};
+
+// Simt
+template <typename WarpShape, typename RegularWarpIterator, typename Policy>
+struct DefaultWarpIteratorBFromASharedMemory<
+    WarpShape,
+    cutlass::gemm::GemmShape<1, 1, 1>,
+    RegularWarpIterator,
+    Policy> {
+  using InstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+  static constexpr auto kWarpSize = 32;
+
+  // We just use the same iterator, as we reproduced the same shared-memory
+  // schema. Just modify it to handle non-complete tiles.
+  using WarpIterator = RegularWarpIterator;
+};
+
 
 // Converts a "regular" Mma into their counterpart from shared memory
 template <
     typename Mma_,
     int kMaxK,
     typename WarpIteratorA_,
+    typename WarpIteratorB_,
     /// whether or not to apply elementwise multiplication of operand A by
     /// another matrix in shared memory before usage in A @ B
     bool kScaleOperandA,
+    bool kPreloadedOperandB,
     bool kForceSmemHoldEntireB,
     bool kTransposeA = false>
 struct DefaultMmaFromSharedMemory;
@@ -1464,6 +1572,8 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
+    typename WarpIteratorB_,
+    bool kPreloadedOperandB,
     bool kForceSmemHoldEntireB,
     /// Data type of accumulator matrix
     typename ElementC_,
@@ -1495,7 +1605,9 @@ struct DefaultMmaFromSharedMemory<
         TransformB_>,
     kMaxK,
     WarpIteratorA_,
+    WarpIteratorB_,
     kScaleOperandA,
+    kPreloadedOperandB,
     kForceSmemHoldEntireB,
     kTransposeA> {
   static constexpr int kWarpSize = 32;
@@ -1519,9 +1631,24 @@ struct DefaultMmaFromSharedMemory<
 
   static constexpr bool kIsTransposedA = false;
   using WarpIteratorA = WarpIteratorA_;
-  using IteratorB =
-      typename cutlass::transform::threadblock::MakeIteratorResidualLast<
-          IteratorB_>::Iterator;
+
+  using IteratorB = typename cutlass::platform::conditional<
+      kPreloadedOperandB,
+      NoOpIterator<
+          cutlass::TensorRef<
+              typename WarpIteratorB_::Element,
+              typename WarpIteratorB_::Layout>>,
+      typename cutlass::transform::threadblock::MakeIteratorResidualLast<IteratorB_>::Iterator
+  >::type;
+
+  using SmemIteratorB = typename cutlass::platform::conditional<
+      kPreloadedOperandB,
+      NoOpIterator<
+          cutlass::TensorRef<
+              typename WarpIteratorB_::Element,
+              typename WarpIteratorB_::Layout>>,
+      SmemIteratorB_
+  >::type;
 
   using Mma = typename cutlass::gemm::threadblock::MmaPipelinedFromSharedMemory<
       Shape_,
@@ -1529,8 +1656,10 @@ struct DefaultMmaFromSharedMemory<
       kScaleOperandA,
       kMaxK,
       IteratorB,
+      SmemIteratorB,
+      WarpIteratorB_,
+      kPreloadedOperandB,
       kForceSmemHoldEntireB,
-      SmemIteratorB_,
       ElementC_,
       LayoutC_,
       Policy_>;
@@ -1556,6 +1685,8 @@ template <
     /// Iterates over tiles of B operand in shared memory
     /// (concept: WriteableTileIterator | RandomAccessTileIterator)
     typename SmemIteratorB_,
+    typename WarpIteratorB_,
+    bool kPreloadedOperandB,
     bool kForceSmemHoldEntireB,
     /// Cache operation for operand B
     cutlass::arch::CacheOperation::Kind CacheOpB,
@@ -1590,7 +1721,9 @@ struct DefaultMmaFromSharedMemory<
         SharedMemoryClear>,
     kMaxK,
     WarpIteratorA_,
+    WarpIteratorB_,
     kScaleOperandA,
+    kPreloadedOperandB,
     kForceSmemHoldEntireB,
     kTransposeA> {
   static constexpr int kWarpSize = 32;
@@ -1624,16 +1757,27 @@ struct DefaultMmaFromSharedMemory<
       (kMaxK + int(Shape_::kK) - 1) / int(Shape_::kK);
   static int constexpr kStages = cutlass::const_min(Stages, kStagesMax);
 
-  using IteratorB =
-      typename cutlass::transform::threadblock::MakeIteratorResidualLast<
-          IteratorB_>::Iterator;
+  using IteratorB = typename cutlass::platform::conditional<
+      kPreloadedOperandB,
+      NoOpIterator<typename WarpIteratorA_::TensorRef>,
+      typename cutlass::transform::threadblock::MakeIteratorResidualLast<IteratorB_>::Iterator
+  >::type;
+
+  using SmemIteratorB = typename cutlass::platform::conditional<
+      kPreloadedOperandB,
+      NoOpIterator<typename WarpIteratorB_::TensorRef>,
+      SmemIteratorB_
+  >::type;
+
   using Mma =
       typename cutlass::gemm::threadblock::MmaMultistageFromSharedMemory<
           Shape_,
           WarpIteratorA,
           kScaleOperandA,
           IteratorB,
-          SmemIteratorB_,
+          SmemIteratorB,
+          WarpIteratorB_,
+          kPreloadedOperandB,
           kForceSmemHoldEntireB,
           RegularMma::kCacheOpB,
           ElementC_,

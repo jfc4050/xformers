@@ -127,8 +127,8 @@ def assert_allclose(
         # print("ref")
         # print(ref.squeeze())
 
-        # print("diff")
-        # print((out - ref).abs().squeeze())
+        print("diff")
+        print((out - ref).abs().squeeze())
 
         print(errmsg)
 
@@ -139,9 +139,9 @@ def assert_allclose(
 @pytest.mark.parametrize("dtype", [torch.float16])
 def test_attn(dtype, dropout_p):
     batch_sz = 1
-    n_queries = 512
+    n_queries = 1024
     # n_queries = 32
-    n_keys = 512
+    n_keys = 1024
     # n_keys = 1024
     n_heads = 1
     # head_dim = 24
@@ -167,6 +167,11 @@ def test_attn(dtype, dropout_p):
         device="cuda",
         requires_grad=True,
     )
+    # key = torch.arange(0, n_keys * head_dim, dtype=dtype, device="cuda").reshape(n_keys, head_dim) / 100
+    # key = key[None, :, None, :].expand(batch_sz, n_keys, n_heads, head_dim).contiguous()
+    # key *= 10
+    # key.requires_grad_(True)
+
     value = torch.randn(
         batch_sz,
         n_keys,
@@ -290,8 +295,8 @@ def test_attn(dtype, dropout_p):
             failed.append(name)
 
     if len(failed) > 0:
-        print("dO @ V")
-        print(grad_out.squeeze() @ value.squeeze().transpose(0, 1))
+        # print("dO @ V")
+        # print(grad_out.squeeze() @ value.squeeze().transpose(0, 1))
         assert False, f"failed: {failed}"
 
 

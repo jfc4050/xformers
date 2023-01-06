@@ -5,7 +5,7 @@
 #include "cutlass/gemm/threadblock/mma_multistage.h"
 #include "cutlass/gemm/threadblock/mma_pipelined.h"
 
-template <typename Mma, int kMaxK>
+template <typename Mma, int kMaxK, bool kForceSmemHoldEntireOperands>
 struct MakeCustomMma;
 
 template <
@@ -21,7 +21,8 @@ template <
     typename Policy,
     int Stages,
     cutlass::gemm::SharedMemoryClearOption SharedMemoryClear,
-    int kMaxK>
+    int kMaxK,
+    bool kForceSmemHoldEntireOperands>
 struct MakeCustomMma<
     cutlass::gemm::threadblock::MmaMultistage<
         Shape,
@@ -36,14 +37,19 @@ struct MakeCustomMma<
         Policy,
         Stages,
         SharedMemoryClear>,
-    kMaxK> {
-  // Reduce the number of stages if we don't need that many
+    kMaxK,
+    kForceSmemHoldEntireOperands> {
+
+  static constexpr int kStagesToHoldEntireOperands = (kMaxK + int(Shape::kK) - 1) / int(Shape::kK);
+
   static int constexpr kStages =
-      kMaxK == cutlass::platform::numeric_limits<int>::max()
+    kMaxK == cutlass::platform::numeric_limits<int>::max()
       ? Stages
-      : cutlass::const_min(
-            Stages,
-            (kMaxK + int(Shape::kK) - 1) / int(Shape::kK));
+      : kForceSmemHoldEntireOperands
+        ? kStagesToHoldEntireOperands
+        // Reduce the number of stages if we don't need that many
+        : cutlass::const_min(Stages, kStagesToHoldEntireOperands);
+
   using Mma = cutlass::gemm::threadblock::CustomMmaMultistage<
       Shape,
       IteratorA,
@@ -80,7 +86,8 @@ struct MakeCustomMma<
         ElementC,
         LayoutC,
         Policy>,
-    kMaxK> {
+    kMaxK,
+    false> {
   using Mma = cutlass::gemm::threadblock::CustomMmaPipelined<
       Shape,
       IteratorA,
