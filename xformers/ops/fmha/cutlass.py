@@ -101,7 +101,7 @@ class FwOp(AttentionFwOpBase):
         if type(inp.attn_bias) not in FwOp.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
         uses_attn_bias = isinstance(inp.attn_bias, torch.Tensor)
-        causal = isinstance(inp.attn_bias, LowerTriangularMask)
+        causal = isinstance(inp.attn_bias, LowerTriangularMask) or inp.causal
         cu_seqlen_k, cu_seqlen_q, max_seqlen_q = _get_seqlen_info(inp)
         out, lse, rng_seed, rng_offset = cls.OPERATOR(
             query=inp.query,
@@ -224,7 +224,7 @@ class BwOp(AttentionBwOpBase):
         if type(inp.attn_bias) not in BwOp.SUPPORTED_ATTN_BIAS_TYPES:
             raise NotImplementedError("Unsupported attn_bias type")
         uses_attn_bias = isinstance(inp.attn_bias, torch.Tensor)
-        causal = isinstance(inp.attn_bias, LowerTriangularMask)
+        causal = isinstance(inp.attn_bias, LowerTriangularMask) or inp.causal
         dtype = inp.query.dtype
 
         force_pad_inf = torch.cuda.get_device_capability(inp.query.device) == (7, 5)

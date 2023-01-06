@@ -71,6 +71,7 @@ class _fMHA(torch.autograd.Function):
             op_bw = op_ctx.op_bw
         ctx.op_fw = op_fw
         ctx.op_bw = op_bw
+        ctx.causal = inp.causal or isinstance(inp.attn_bias, LowerTriangularMask)
         ctx.p = inp.p
         # used for cutlass backward with dropout
         ctx.rng_seed = op_ctx.rng_seed
@@ -101,6 +102,7 @@ class _fMHA(torch.autograd.Function):
             key=key,
             value=value,
             attn_bias=cls.deserialize_bias(ctx.attn_bias_ctx, attn_bias_tensor),
+            causal=ctx.causal,
             p=ctx.p,
             scale=ctx.scale,
         )
@@ -125,6 +127,7 @@ def memory_efficient_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    causal: bool = False,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -198,7 +201,7 @@ def memory_efficient_attention(
     """
     return _memory_efficient_attention(
         Inputs(
-            query=query, key=key, value=value, p=p, attn_bias=attn_bias, scale=scale
+            query=query, key=key, value=value, p=p, attn_bias=attn_bias, causal=causal, scale=scale
         ),
         op=op,
     )
@@ -209,6 +212,7 @@ def memory_efficient_attention_forward(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    causal: bool = False,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -217,7 +221,7 @@ def memory_efficient_attention_forward(
     """Returns a tuple (output, lse), where `lse` can be used to compute the backward pass later"""
     return _memory_efficient_attention_forward(
         Inputs(
-            query=query, key=key, value=value, p=p, attn_bias=attn_bias, scale=scale
+            query=query, key=key, value=value, p=p, attn_bias=attn_bias, causal=causal, scale=scale
         ),
         op=op,
     )
@@ -228,6 +232,7 @@ def memory_efficient_attention_forward_requires_grad(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    causal: bool = False,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -245,7 +250,7 @@ def memory_efficient_attention_forward_requires_grad(
         )
     out, ctx = _memory_efficient_attention_forward_requires_grad(
         Inputs(
-            query=query, key=key, value=value, p=p, attn_bias=attn_bias, scale=scale
+            query=query, key=key, value=value, p=p, attn_bias=attn_bias, causal=causal, scale=scale
         ),
         op=op,
     )
@@ -260,6 +265,7 @@ def memory_efficient_attention_backward(
     key: torch.Tensor,
     value: torch.Tensor,
     attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None,
+    causal: bool = False,
     p: float = 0.0,
     scale: Optional[float] = None,
     *,
@@ -279,7 +285,7 @@ def memory_efficient_attention_backward(
     gradients = _memory_efficient_attention_backward(
         Context(out=output, lse=lse),
         Inputs(
-            query=query, key=key, value=value, p=p, attn_bias=attn_bias, scale=scale
+            query=query, key=key, value=value, p=p, attn_bias=attn_bias, causal=causal, scale=scale
         ),
         grad,
         op=op,
@@ -298,7 +304,7 @@ def _memory_efficient_attention(
 
     output_shape = inp.normalize_bmhk()
     return _fMHA.apply(
-        op, inp.query, inp.key, inp.value, inp.attn_bias, inp.p, inp.scale
+        op, inp.query, inp.key, inp.value, inp.attn_bias, inp.causal, inp.p, inp.scale
     ).reshape(output_shape)
 
 

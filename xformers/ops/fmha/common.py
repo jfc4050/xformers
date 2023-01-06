@@ -74,6 +74,7 @@ class Inputs:
     key: torch.Tensor
     value: torch.Tensor
     attn_bias: Optional[Union[torch.Tensor, AttentionMask]] = None
+    causal: bool = False
     p: float = 0.0
     scale: Optional[float] = None
 
