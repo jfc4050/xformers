@@ -16,7 +16,7 @@ from utils import benchmark_main_helper
 import xformers.ops
 import xformers.ops.fmha as fmha
 
-CHECK_CORRECTNESS = True
+CHECK_CORRECTNESS = False
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
@@ -78,42 +78,46 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = [
-    # ViT
-    (384, 197, 1, 88),
-    (384, 197, 1, 80),
-    (384, 197, 1, 64),
-    (1024, 197, 1, 88),
-    (1024, 197, 1, 80),
-    (1024, 197, 1, 64),
-    # ViT-Huge
-    (32 * 16, 197, 1, 80),
-    (32, 197, 16, 80),
-    (32, 197, 16, 64),
-    (32, 197, 16, 128),
-    # ViT-Giant
-    (16 * 16, 197, 1, 88),
-    (16, 197, 16, 88),
-    (16, 197, 16, 64),
-    (16, 197, 16, 128),
-    # GPT-Z
-    (1, 4096, 160, 128),
-    (2, 4096, 160, 128),
-    (1, 8192, 160, 128),
-    (2, 8192, 160, 128),
-    # FB models
-    (1024, 82, 8, 64),
-    (150, 256, 16, 64),
-    (64, 256, 12, 64),
-    # Stable diffusion (https://github.com/huggingface/diffusers/pull/532)
-    (1, 4096, 16, 40),  # 512x512
-    (1, 16384, 16, 40),  # 1024x1024
-    # ParlAI model
-    (256, 4096, 16, 64),
-    # Zetta B M H K
-    (8, 2048, 20, 128),
-    *sorted(
-        list(itertools.product([16, 64], [128, 512, 1024], [16], [16, 32, 64, 128]))
-    ),
+    (4, 4096, 64, 128),
+    (8, 4096, 64, 128),
+    (4, 8192, 64, 128),
+    (8, 8192, 64, 128)
+    # # ViT
+    # (384, 197, 1, 88),
+    # (384, 197, 1, 80),
+    # (384, 197, 1, 64),
+    # (1024, 197, 1, 88),
+    # (1024, 197, 1, 80),
+    # (1024, 197, 1, 64),
+    # # ViT-Huge
+    # (32 * 16, 197, 1, 80),
+    # (32, 197, 16, 80),
+    # (32, 197, 16, 64),
+    # (32, 197, 16, 128),
+    # # ViT-Giant
+    # (16 * 16, 197, 1, 88),
+    # (16, 197, 16, 88),
+    # (16, 197, 16, 64),
+    # (16, 197, 16, 128),
+    # # GPT-Z
+    # (1, 4096, 160, 128),
+    # (2, 4096, 160, 128),
+    # (1, 8192, 160, 128),
+    # (2, 8192, 160, 128),
+    # # FB models
+    # (1024, 82, 8, 64),
+    # (150, 256, 16, 64),
+    # (64, 256, 12, 64),
+    # # Stable diffusion (https://github.com/huggingface/diffusers/pull/532)
+    # (1, 4096, 16, 40),  # 512x512
+    # (1, 16384, 16, 40),  # 1024x1024
+    # # ParlAI model
+    # (256, 4096, 16, 64),
+    # # Zetta B M H K
+    # (8, 2048, 20, 128),
+    # *sorted(
+    #     list(itertools.product([16, 64], [128, 512, 1024], [16], [16, 32, 64, 128]))
+    # ),
 ]
 
 
@@ -138,14 +142,12 @@ CASES = list(
     product_dict(
         shape=SHAPES,
         num_threads=NUM_THREADS,
-        dropout_p=[0.0, 0.3],
+        dropout_p=[0.3],
         attn_bias_cfg=[
-            (type(None), False),
             (torch.Tensor, False),
             (torch.Tensor, True),
-            (xformers.ops.LowerTriangularMask, False),
         ],
-        dtype=[torch.half, torch.bfloat16, torch.float],
+        dtype=[torch.half, torch.bfloat16],
     )
 )
 
@@ -162,18 +164,18 @@ def create_tensors(shape, dtype, requires_grad=False):
 def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
     B, M, H, K = shape
     _, q, k, v = create_tensors(shape, dtype)
-    attn_bias_type, attn_bias_requires_grad = attn_bias_cfg
+    attn_bias_type, causal = attn_bias_cfg
     bias = create_attn_bias(
         attn_bias_type,
-        batch_size=B,
+        batch_size=1,
         num_heads=H,
         q_len=M,
         kv_len=M,
         device=device,
         dtype=dtype,
-        bias_requires_grad=attn_bias_requires_grad,
-    )
-    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, p=dropout_p)
+        bias_requires_grad=False,
+    ).expand(B * H, M, M)
+    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, causal=causal, p=dropout_p)
 
     try:
         op = (fmha._dispatch_fw(inp), None) if FORCE_OP is None else FORCE_OP
@@ -190,12 +192,12 @@ def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
     }[dtype]
     sub_label = (
         f"{dtype_str} B={B}, M={M}, H={H}, K={K}, p={dropout_p}, "
-        f" BiasT={attn_bias_type.__name__}, BiasGrad={attn_bias_requires_grad}"
+        f" BiasT={attn_bias_type.__name__}, Causal={causal}"
     )
 
     try:
         r = xformers.ops.memory_efficient_attention(
-            q, k, v, inp.attn_bias, op=op
+            q, k, v, inp.attn_bias, causal, op=op
         ).float()
         rr = ref_attention(
             q.float(),
@@ -216,12 +218,13 @@ def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
         pass
 
     yield benchmark.Timer(
-        stmt="fn(q, k, v, attn_bias, p)",
+        stmt="fn(q, k, v, attn_bias, causal, p)",
         globals={
             "q": q,
             "k": k,
             "v": v,
             "attn_bias": inp.attn_bias,
+            "causal": inp.causal,
             "p": dropout_p,
             "fn": partial(xformers.ops.memory_efficient_attention, op=op),
         },
@@ -251,18 +254,18 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
     B, M, H, K = shape
     qkv, q, k, v = create_tensors(shape, dtype, requires_grad=True)
 
-    attn_bias_type, attn_bias_requires_grad = attn_bias_cfg
+    attn_bias_type, causal = attn_bias_cfg
     bias = create_attn_bias(
         attn_bias_type,
-        batch_size=B,
+        batch_size=1,
         num_heads=H,
         q_len=M,
         kv_len=M,
         device=device,
         dtype=dtype,
-        bias_requires_grad=attn_bias_requires_grad,
-    )
-    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, p=dropout_p)
+        bias_requires_grad=False,
+    ).expand(B * H, M, M)
+    inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, causal=causal, p=dropout_p)
     try:
         if FORCE_OP:
             op = FORCE_OP
@@ -288,11 +291,11 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
     }[dtype]
     sub_label = (
         f"{dtype_str} B={B}, M={M}, H={H}, K={K}, p={dropout_p},"
-        f" BiasT={attn_bias_type.__name__}, BiasGrad={attn_bias_requires_grad}"
+        f" BiasT={attn_bias_type.__name__}, Causal={causal}"
     )
 
     out = xformers.ops.memory_efficient_attention(
-        inp.query, inp.key, inp.value, inp.attn_bias, inp.p, op=op
+        inp.query, inp.key, inp.value, inp.attn_bias, inp.causal, inp.p, op=op
     )
     grad_benchmark = torch.ones_like(q)
 
