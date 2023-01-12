@@ -225,13 +225,20 @@ def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
 
 
 def create_attn_bias(
-    bias_type, batch_size: int, q_len: int, kv_len: int, device, dtype
+    bias_type, batch_size: int, q_len: int, kv_len: int, device, dtype, causal: bool = False
 ):
     if bias_type is None:
         return None
     if bias_type is torch.Tensor:
         attn_bias = torch.randn((batch_size, 1, kv_len), device=device, dtype=dtype) * 3
-        return attn_bias.expand(batch_size, q_len, kv_len)
+        bias = attn_bias.expand(batch_size, q_len, kv_len).clone()
+
+        if causal:
+            causal_mask = xformers.ops.LowerTriangularMask([batch_size, q_len, kv_len], dtype=dtype, device=device)
+            bias += causal_mask.to_tensor().clone()
+
+        return bias.clone()
+
     if bias_type is xformers.ops.LowerTriangularMask:
         return bias_type([batch_size, q_len, kv_len], dtype=dtype, device=device)
     assert False, f"Unsupported bias type: {bias_type}"
@@ -250,6 +257,7 @@ def create_tensors(
     *,
     attn_bias_type=None,
     fmt: str = "BMK",
+    causal: bool = False
 ):
     torch.manual_seed(B * q_len + kv_len * k + kv)
     scale = 3
@@ -272,6 +280,7 @@ def create_tensors(
             kv_len=kv_len,
             dtype=dtype,
             device=device,
+            causal=causal,
         )
 
     inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
@@ -621,12 +630,14 @@ def test_logsumexp(op_device_dtype_B_Mq_Mkv_H_K_Kv):
 
 @pytest.mark.parametrize("fmt", ["BMK", "BMHK"])
 @pytest.mark.parametrize(
-    "attn_bias_cfg",  # (type(bias), bias.requires_grad)
+    "attn_bias_cfg",  # (type(bias), bias.requires_grad, causal)
     [
-        (None, False),
-        (xformers.ops.LowerTriangularMask, False),
-        (torch.Tensor, True),
-        (torch.Tensor, False),
+        (None, False, False),
+        (None, False, True),
+        (torch.Tensor, False, False),
+        (torch.Tensor, False, True),
+        (torch.Tensor, True, False),
+        (torch.Tensor, True, True),
     ],
 )
 @pytest.mark.parametrize("grad_out_contiguous", [False, True])
@@ -641,7 +652,7 @@ def test_backward(
     attn_bias_cfg,
     fmt,
 ):
-    attn_bias_type, attn_bias_requires_grad = attn_bias_cfg
+    attn_bias_type, attn_bias_requires_grad, causal = attn_bias_cfg
     (
         op_bw,
         device,
@@ -657,6 +668,7 @@ def test_backward(
         *op_device_dtype_B_Mq_Mkv_H_K_Kv,
         attn_bias_type=attn_bias_type,
         fmt=fmt,
+        causal=causal,
     )
     op_fw = (
         sample_random_supported_fw(
@@ -689,7 +701,7 @@ def test_backward(
         pytest.skip("inputs not supported")
 
     out = xformers.ops.memory_efficient_attention(
-        query, key, value, attn_bias, op=(op_fw, op_bw)
+        query, key, value, attn_bias, causal=causal, op=(op_fw, op_bw)
     )
 
     grad_out = torch.ones_like(out)
@@ -714,6 +726,7 @@ def test_backward(
         grads = [qkv.grad]
         qkv.grad = None
     if attn_bias_requires_grad:
+        attn_bias.grad[attn_bias.grad == -float("inf")] = 0
         grads.append(attn_bias.grad)
         attn_bias.grad = None
 
@@ -822,12 +835,12 @@ def test_dropout(op, q_len, kv_len, batch_size, k_len, p, seed):
 
     torch.manual_seed(seed)
     out = xformers.ops.memory_efficient_attention(
-        query, key, value, attn_bias, p, op=(op, None)
+        query, key, value, attn_bias, causal=False, p=p, op=(op, None)
     )
 
     torch.manual_seed(seed)
     out2 = xformers.ops.memory_efficient_attention(
-        query, key, value, attn_bias, p, op=(op, None)
+        query, key, value, attn_bias, causal=False, p=p, op=(op, None)
     )
 
     assert_allclose(out, out2)
@@ -1094,7 +1107,7 @@ def test_custom_scale(op_device_dtype_B_Mq_Mkv_H_K_Kv):
         pytest.skip(f"{op_bw.NAME}: unsupported ({inputs})")
 
     out = xformers.ops.memory_efficient_attention(
-        query, key, value, attn_bias, p, scale, op=(op_fw, op_bw)
+        query, key, value, attn_bias, causal=False, p=p, scale=scale, op=(op_fw, op_bw)
     )
     out.backward(grad_out)
     grad_q, grad_k, grad_v = query.grad, key.grad, value.grad
