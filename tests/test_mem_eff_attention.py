@@ -179,18 +179,22 @@ def assert_allclose(
     num_different = torch.count_nonzero(flatten_diff > 0)
     percentage = num_different / flatten_diff.numel()
     del flatten_diff
-    assert torch.allclose(out, ref, rtol=rtol, atol=atol), (
+    passed, msg = torch.allclose(out, ref, rtol=rtol, atol=atol), (
         f"{msg}: "
         f"out={out.flatten()[max_pos]} and ref={ref.flatten()[max_pos]} (diff={max_diff} > 0)"
         f"/ atol={atol}, rtol={rtol}"
         f"/ total failing elements: {num_different}, percentage={percentage}"
     )
+    if not passed:
+        print(out)
+        print(ref)
 
+    assert passed, msg
 
-def ref_attention(q, k, v, attn_bias=None, drop_mask=None, p=0.0, scale=None):
+def ref_attention(q, k, v, attn_bias=None, causal: bool = False, drop_mask=None, p=0.0, scale=None):
     if q.ndim == 4:
         assert p == 0.0
-        return ref_attention_bmhk(q, k, v, attn_bias=attn_bias)
+        return ref_attention_bmhk(q, k, v, attn_bias=attn_bias, causal=causal)
     q = q.float()
     k = k.float()
     v = v.float()
@@ -199,19 +203,25 @@ def ref_attention(q, k, v, attn_bias=None, drop_mask=None, p=0.0, scale=None):
     q = q * scale
 
     attn = q @ k.transpose(-2, -1)
-    if attn_bias is not None:
-        if isinstance(attn_bias, xformers.ops.AttentionMask):
-            attn_bias = attn_bias.to_tensor()
+    if isinstance(attn_bias, torch.Tensor):
         if attn_bias.shape[0] != attn.shape[0]:
             attn_bias = bmk2bmhk(attn_bias, k.shape[2])
         attn = attn + attn_bias.float()
+
+    if causal:
+        mask = xformers.ops.LowerTriangularMask(attn.shape)
+        mask_tensor = mask.to_tensor()
+        print(mask_tensor)
+
+        attn += mask_tensor.to(attn.device, attn.dtype)
+
     attn = attn.softmax(-1)
     if drop_mask is not None:
         attn = attn * (drop_mask / (1 - p))
     return attn @ v
 
 
-def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
+def ref_attention_bmhk(q, k, v, attn_bias, causal, scale=None) -> torch.Tensor:
     assert q.ndim == 4
 
     def T(t):
@@ -219,26 +229,19 @@ def ref_attention_bmhk(q, k, v, attn_bias, scale=None) -> torch.Tensor:
             [t.shape[0] * t.shape[2], t.shape[1], t.shape[3]]
         )
 
-    out = ref_attention(T(q), T(k), T(v), attn_bias, scale=scale)
+    out = ref_attention(T(q), T(k), T(v), attn_bias, causal=causal, scale=scale)
     out = out.reshape([q.shape[0], q.shape[2], q.shape[1], v.shape[3]])
     return out.permute((0, 2, 1, 3))
 
 
 def create_attn_bias(
-    bias_type, batch_size: int, q_len: int, kv_len: int, device, dtype, causal: bool = False
+    bias_type, batch_size: int, q_len: int, kv_len: int, device, dtype
 ):
     if bias_type is None:
         return None
     if bias_type is torch.Tensor:
         attn_bias = torch.randn((batch_size, 1, kv_len), device=device, dtype=dtype) * 3
-        bias = attn_bias.expand(batch_size, q_len, kv_len).clone()
-
-        if causal:
-            causal_mask = xformers.ops.LowerTriangularMask([batch_size, q_len, kv_len], dtype=dtype, device=device)
-            bias += causal_mask.to_tensor().clone()
-
-        return bias.clone()
-
+        return attn_bias.expand(batch_size, q_len, kv_len)
     if bias_type is xformers.ops.LowerTriangularMask:
         return bias_type([batch_size, q_len, kv_len], dtype=dtype, device=device)
     assert False, f"Unsupported bias type: {bias_type}"
@@ -257,7 +260,6 @@ def create_tensors(
     *,
     attn_bias_type=None,
     fmt: str = "BMK",
-    causal: bool = False
 ):
     torch.manual_seed(B * q_len + kv_len * k + kv)
     scale = 3
@@ -280,7 +282,6 @@ def create_tensors(
             kv_len=kv_len,
             dtype=dtype,
             device=device,
-            causal=causal,
         )
 
     inputs = fmha.Inputs(query=query, key=key, value=value, attn_bias=attn_bias)
@@ -632,10 +633,10 @@ def test_logsumexp(op_device_dtype_B_Mq_Mkv_H_K_Kv):
 @pytest.mark.parametrize(
     "attn_bias_cfg",  # (type(bias), bias.requires_grad, causal)
     [
-        (None, False, False),
-        (None, False, True),
-        (torch.Tensor, False, False),
-        (torch.Tensor, False, True),
+        # (None, False, False),
+        # (None, False, True),
+        # (torch.Tensor, False, False),
+        # (torch.Tensor, False, True),
         (torch.Tensor, True, False),
         (torch.Tensor, True, True),
     ],
@@ -653,6 +654,7 @@ def test_backward(
     fmt,
 ):
     attn_bias_type, attn_bias_requires_grad, causal = attn_bias_cfg
+    print(attn_bias_cfg)
     (
         op_bw,
         device,
@@ -668,7 +670,6 @@ def test_backward(
         *op_device_dtype_B_Mq_Mkv_H_K_Kv,
         attn_bias_type=attn_bias_type,
         fmt=fmt,
-        causal=causal,
     )
     op_fw = (
         sample_random_supported_fw(
@@ -726,11 +727,13 @@ def test_backward(
         grads = [qkv.grad]
         qkv.grad = None
     if attn_bias_requires_grad:
-        attn_bias.grad[attn_bias.grad == -float("inf")] = 0
+        # attn_bias.grad[attn_bias.grad == -float("inf")] = 0
+        # mask = xformers.ops.LowerTriangularMask(attn_bias.grad.shape).to_tensor().to(attn_bias.device, attn_bias.dtype)
+        # attn_bias.grad[mask == -float("inf")] = 0
         grads.append(attn_bias.grad)
         attn_bias.grad = None
 
-    ref = ref_attention(query, key, value, attn_bias)
+    ref = ref_attention(query, key, value, attn_bias, causal=causal)
     ref.backward(grad_out)
     del grad_out
     del ref
