@@ -45,6 +45,9 @@ def _prepare_inputs(inp: Inputs) -> Inputs:
         h = attn_bias.shape[0] // B
         attn_bias = attn_bias.reshape(B, h, attn_bias.shape[1], attn_bias.shape[2])
 
+    if not isinstance(attn_bias, torch.Tensor):
+        attn_bias = None
+
     # Make sure that the last dimension is contiguous
     query, key, value = [
         x if x.stride(-1) == 1 else x.contiguous()

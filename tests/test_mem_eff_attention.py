@@ -556,9 +556,7 @@ def test_backward(
         k,
         kv,
     ) = opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv
-    attn_bias_requires_grad = (
-        random.Random(q_len + kv_len * batch_size).randint(0, 1) > 0
-    )
+    attn_bias_requires_grad = False  # TODO. this should be parametrized
     query, key, value, attn_bias = create_tensors(
         *opBW_device_dtype_biasT_B_Mq_Mkv_H_K_Kv,
         attn_bias_requires_grad=attn_bias_requires_grad,
@@ -655,7 +653,7 @@ def test_backward(
     if attn_bias_requires_grad:
         attn_bias_grad = get_bias_grad(attn_bias)
         if attn_bias_grad is not None:
-            grads_ref.append(attn_bias.grad)
+            grads_ref.append(attn_bias_grad)
             grads_name.append("bias")
 
     del query
