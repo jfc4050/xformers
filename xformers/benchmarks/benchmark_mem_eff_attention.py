@@ -15,6 +15,7 @@ from utils import benchmark_main_helper
 
 import xformers.ops
 import xformers.ops.fmha as fmha
+from xformers.ops.fmha.attn_bias import LowerTriangularMaskWithTensorBias
 
 CHECK_CORRECTNESS = True
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -45,15 +46,15 @@ def create_attn_bias(
 
 
 def ref_attention_bmk(q, k, v, attn_bias=None, p=0.0):
-    if isinstance(attn_bias, xformers.ops.AttentionMask):
-        attn_bias = attn_bias.to_tensor()
-    if isinstance(attn_bias, torch.Tensor):
-        attn_bias = attn_bias.to(q.dtype)
     q = q * (1.0 / q.shape[-1] ** 0.5)
     if attn_bias is None:
         attn = q @ k.transpose(-2, -1)
     else:
-        # print([x.dtype for x in [attn_bias, q, k]])
+        if isinstance(attn_bias, xformers.ops.AttentionBias):
+            attn_bias = attn_bias.materialize((q.shape[0], q.shape[1], k.shape[1]), device=q.device, dtype=q.dtype)
+        elif isinstance(attn_bias, torch.Tensor):
+            attn_bias = attn_bias.to(q.dtype)
+
         # equivalent to (q @ k.transpose(-2, -1) + m).softmax(-1) @ v
         # but faster, and is what is used in PyTorch now
         attn = torch.baddbmm(attn_bias, q, k.transpose(-2, -1))
@@ -133,7 +134,7 @@ def create_tensors(shape, dtype, requires_grad=False):
 def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
     B, M, H, K = shape
     _, q, k, v = create_tensors(shape, dtype)
-    attn_bias_type, attn_bias_requires_grad = attn_bias_cfg
+    attn_bias_type, causal = attn_bias_cfg
     bias = create_attn_bias(
         attn_bias_type,
         batch_size=B,
@@ -142,8 +143,10 @@ def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
         kv_len=M,
         device=device,
         dtype=dtype,
-        bias_requires_grad=attn_bias_requires_grad,
+        bias_requires_grad=False,
     )
+    if causal:
+        bias = LowerTriangularMaskWithTensorBias(bias)
     inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, p=dropout_p)
 
     try:
@@ -161,7 +164,7 @@ def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
     }[dtype]
     sub_label = (
         f"{dtype_str} B={B}, M={M}, H={H}, K={K}, p={dropout_p}, "
-        f" BiasT={attn_bias_type.__name__}, BiasGrad={attn_bias_requires_grad}"
+        f" BiasT={attn_bias_type.__name__}, Causal={causal}"
     )
 
     try:
@@ -223,7 +226,7 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
     B, M, H, K = shape
     qkv, q, k, v = create_tensors(shape, dtype, requires_grad=True)
 
-    attn_bias_type, attn_bias_requires_grad = attn_bias_cfg
+    attn_bias_type, causal = attn_bias_cfg
     bias = create_attn_bias(
         attn_bias_type,
         batch_size=B,
@@ -232,8 +235,10 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
         kv_len=M,
         device=device,
         dtype=dtype,
-        bias_requires_grad=attn_bias_requires_grad,
+        bias_requires_grad=False,
     )
+    if causal:
+        bias = LowerTriangularMaskWithTensorBias(bias)
     inp = fmha.Inputs(query=q, key=k, value=v, attn_bias=bias, p=dropout_p)
     try:
         if FORCE_OP:
@@ -260,7 +265,7 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
     }[dtype]
     sub_label = (
         f"{dtype_str} B={B}, M={M}, H={H}, K={K}, p={dropout_p},"
-        f" BiasT={attn_bias_type.__name__}, BiasGrad={attn_bias_requires_grad}"
+        f" BiasT={attn_bias_type.__name__}, Causal={causal}"
     )
 
     for op_impl in [xformers.ops.TritonFlashAttentionOp, xformers.ops.MemoryEfficientAttentionCutlassOp]:

@@ -24,7 +24,7 @@ else:
     triton_flash_backward = None
     triton_flash_forward = None
 
-from .attn_bias import LowerTriangularMask
+from .attn_bias import LowerTriangularMask, LowerTriangularMaskWithTensorBias
 from .common import (
     AttentionBwOpBase,
     AttentionFwOpBase,
@@ -37,6 +37,9 @@ from .common import (
 
 def _prepare_inputs(inp: Inputs) -> Inputs:
     attn_bias = inp.attn_bias
+    if isinstance(attn_bias, LowerTriangularMaskWithTensorBias):
+        attn_bias = attn_bias._bias
+
     if isinstance(attn_bias, torch.Tensor) and attn_bias.ndim == 3:
         B = inp.query.shape[0]
         h = attn_bias.shape[0] // B
@@ -62,6 +65,7 @@ class FwOp(AttentionFwOpBase):
         LowerTriangularMask,
         # TODO: backwards accuracy is failing for a few cases, perhaps we want to disable this for now.
         torch.Tensor,
+        LowerTriangularMaskWithTensorBias,
     }
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True
@@ -86,15 +90,17 @@ class FwOp(AttentionFwOpBase):
     def apply(
         cls, inp: Inputs, needs_gradient: bool
     ) -> Tuple[torch.Tensor, Optional[Context]]:
+
+        causal = isinstance(inp.attn_bias, (LowerTriangularMask, LowerTriangularMaskWithTensorBias))
         inp = _prepare_inputs(inp)
 
         out, lse, softmax_scale = triton_flash_forward(
             q=inp.query,
             k=inp.key,
             v=inp.value,
-            bias=inp.attn_bias if isinstance(inp.attn_bias, torch.Tensor) else None,
+            bias=inp.attn_bias,
             softmax_scale=inp.scale_float,
-            causal=isinstance(inp.attn_bias, LowerTriangularMask),
+            causal=causal,
         )
         return out, Context(lse=lse, out=out)
 
@@ -106,7 +112,14 @@ class BwOp(AttentionBwOpBase):
     CUDA_MINIMUM_COMPUTE_CAPABILITY = FwOp.CUDA_MINIMUM_COMPUTE_CAPABILITY
     SUPPORTED_DTYPES = FwOp.SUPPORTED_DTYPES
     SUPPORTED_MAX_K = FwOp.SUPPORTED_MAX_K
-    SUPPORTED_ATTN_BIAS_TYPES = FwOp.SUPPORTED_ATTN_BIAS_TYPES
+    # SUPPORTED_ATTN_BIAS_TYPES = FwOp.SUPPORTED_ATTN_BIAS_TYPES
+    SUPPORTED_ATTN_BIAS_TYPES: Set[Any] = {
+        type(None),
+        LowerTriangularMask,
+        # TODO: backwards accuracy is failing for a few cases, perhaps we want to disable this for now.
+        torch.Tensor,
+        LowerTriangularMaskWithTensorBias,
+    }
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
     SUPPORTS_CUSTOM_SCALE = FwOp.SUPPORTS_CUSTOM_SCALE
     SUPPORTS_DIFFERENT_VALUE_EMBED = FwOp.SUPPORTS_DIFFERENT_VALUE_EMBED
@@ -127,6 +140,7 @@ class BwOp(AttentionBwOpBase):
 
     @classmethod
     def apply(cls, ctx: Context, inp: Inputs, grad: torch.Tensor) -> Gradients:
+        causal = isinstance(inp.attn_bias, (LowerTriangularMask, LowerTriangularMaskWithTensorBias))
         inp = _prepare_inputs(inp)
 
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
@@ -147,8 +161,8 @@ class BwOp(AttentionBwOpBase):
                 grads.dq,
                 grads.dk,
                 grads.dv,
-                bias=inp.attn_bias if isinstance(inp.attn_bias, torch.Tensor) else None,
+                bias=inp.attn_bias,
                 softmax_scale=inp.scale_float,
-                causal=isinstance(inp.attn_bias, LowerTriangularMask),
+                causal=causal,
             )
         return grads

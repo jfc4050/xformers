@@ -184,7 +184,7 @@ class BwOp(AttentionBwOpBase):
         torch.Tensor,
         LowerTriangularMask,
         # TODO: Fix handling of gradient through the fMHA autograd function
-        # LowerTriangularMaskWithTensorBias,
+        LowerTriangularMaskWithTensorBias,
     }
     SUPPORTS_ATTN_BIAS_GRAD = True
     SUPPORTS_DROPOUT = FwOp.SUPPORTS_DROPOUT
