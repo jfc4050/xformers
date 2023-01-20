@@ -13,7 +13,7 @@ from ... import _is_triton_available
 from ..common import register_operator
 
 if TYPE_CHECKING or _is_triton_available():
-    from ..._flash_attn.flash_attn_triton import (
+    from .flash_attn_triton import (
         _flash_attn_backward,
         _flash_attn_forward,
     )
@@ -61,7 +61,7 @@ class FwOp(AttentionFwOpBase):
         type(None),
         LowerTriangularMask,
         # TODO: backwards accuracy is failing for a few cases, perhaps we want to disable this for now.
-        # torch.Tensor,
+        torch.Tensor,
     }
     SUPPORTS_DROPOUT = False
     SUPPORTS_CUSTOM_SCALE = True

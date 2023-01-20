@@ -46,11 +46,14 @@ def create_attn_bias(
 
 def ref_attention_bmk(q, k, v, attn_bias=None, p=0.0):
     if isinstance(attn_bias, xformers.ops.AttentionMask):
-        attn_bias = attn_bias.to_tensor().to(q.dtype)
+        attn_bias = attn_bias.to_tensor()
+    if isinstance(attn_bias, torch.Tensor):
+        attn_bias = attn_bias.to(q.dtype)
     q = q * (1.0 / q.shape[-1] ** 0.5)
     if attn_bias is None:
         attn = q @ k.transpose(-2, -1)
     else:
+        # print([x.dtype for x in [attn_bias, q, k]])
         # equivalent to (q @ k.transpose(-2, -1) + m).softmax(-1) @ v
         # but faster, and is what is used in PyTorch now
         attn = torch.baddbmm(attn_bias, q, k.transpose(-2, -1))
@@ -78,42 +81,12 @@ device = torch.device("cuda")
 
 NUM_THREADS = [1] if device.type == "cuda" else [1, 40]
 SHAPES = [
-    # ViT
-    (384, 197, 1, 88),
-    (384, 197, 1, 80),
-    (384, 197, 1, 64),
-    (1024, 197, 1, 88),
-    (1024, 197, 1, 80),
-    (1024, 197, 1, 64),
-    # ViT-Huge
-    (32 * 16, 197, 1, 80),
-    (32, 197, 16, 80),
-    (32, 197, 16, 64),
-    (32, 197, 16, 128),
-    # ViT-Giant
-    (16 * 16, 197, 1, 88),
-    (16, 197, 16, 88),
-    (16, 197, 16, 64),
-    (16, 197, 16, 128),
-    # GPT-Z
-    (1, 4096, 160, 128),
-    (2, 4096, 160, 128),
-    (1, 8192, 160, 128),
-    (2, 8192, 160, 128),
-    # FB models
-    (1024, 82, 8, 64),
-    (150, 256, 16, 64),
-    (64, 256, 12, 64),
-    # Stable diffusion (https://github.com/huggingface/diffusers/pull/532)
-    (1, 4096, 16, 40),  # 512x512
-    (1, 16384, 16, 40),  # 1024x1024
-    # ParlAI model
-    (256, 4096, 16, 64),
-    # Zetta B M H K
-    (8, 2048, 20, 128),
-    *sorted(
-        list(itertools.product([16, 64], [128, 512, 1024], [16], [16, 32, 64, 128]))
-    ),
+    # AlexaTM
+    (8, 1024, 64, 128),
+
+    # bedrock
+    (1, 4096, 12, 128),
+    (1, 8192, 12, 128),
 ]
 
 
@@ -123,7 +96,7 @@ FORCE_OP = None
 # FORCE_OP = xformers.ops.MemoryEfficientAttentionCutlassOp
 # FORCE_OP = xformers.ops.MemoryEfficientAttentionFlashAttentionOp
 # FORCE_OP = xformers.ops.MemoryEfficientAttentionCutlassFwdFlashBwOp
-# FORCE_OP = xformers.ops.TritonFlashAttentionOp
+FORCE_OP = xformers.ops.TritonFlashAttentionOp
 # FORCE_OP = xformers.ops.MemoryEfficientAttentionTritonFwdFlashBwOp
 
 
@@ -138,14 +111,12 @@ CASES = list(
     product_dict(
         shape=SHAPES,
         num_threads=NUM_THREADS,
-        dropout_p=[0.0, 0.3],
+        dropout_p=[0.0],  # TODO - add this
         attn_bias_cfg=[
-            (type(None), False),
             (torch.Tensor, False),
             (torch.Tensor, True),
-            (xformers.ops.LowerTriangularMask, False),
         ],
-        dtype=[torch.half, torch.bfloat16, torch.float],
+        dtype=[torch.bfloat16],
     )
 )
 
@@ -212,24 +183,25 @@ def benchmark_forward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype):
             (r - rr).abs().max()
         )
         del r, rr
-    except RuntimeError:  # OOM
-        pass
+    except RuntimeError as e:  # OOM
+        raise e
 
-    yield benchmark.Timer(
-        stmt="fn(q, k, v, attn_bias, p)",
-        globals={
-            "q": q,
-            "k": k,
-            "v": v,
-            "attn_bias": inp.attn_bias,
-            "p": dropout_p,
-            "fn": partial(xformers.ops.memory_efficient_attention, op=op),
-        },
-        label=f"attention (attn_bias={attn_bias_type})",
-        description=op[0].NAME,
-        sub_label=sub_label,
-        num_threads=num_threads,
-    )
+    for op_impl in [xformers.ops.TritonFlashAttentionOp, xformers.ops.MemoryEfficientAttentionCutlassOp]:
+        yield benchmark.Timer(
+            stmt="fn(q, k, v, attn_bias, p)",
+            globals={
+                "q": q,
+                "k": k,
+                "v": v,
+                "attn_bias": inp.attn_bias,
+                "p": dropout_p,
+                "fn": partial(xformers.ops.memory_efficient_attention, op=op_impl),
+            },
+            label=f"attention (attn_bias={attn_bias_type})",
+            description=op_impl[0].NAME,
+            sub_label=sub_label,
+            num_threads=num_threads,
+        )
     yield benchmark.Timer(
         stmt="fn(q, k, v, attn_bias, p)",
         globals={
@@ -291,23 +263,23 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
         f" BiasT={attn_bias_type.__name__}, BiasGrad={attn_bias_requires_grad}"
     )
 
-    out = xformers.ops.memory_efficient_attention(
-        inp.query, inp.key, inp.value, inp.attn_bias, inp.p, op=op
-    )
-    grad_benchmark = torch.ones_like(q)
-
-    yield benchmark.Timer(
-        stmt="out.backward(grad, retain_graph=True)",
-        globals={
-            "out": out,
-            "grad": grad_benchmark,
-        },
-        label=f"attention backward (attn_bias={attn_bias_type})",
-        description=op[1].NAME,
-        sub_label=sub_label,
-        num_threads=num_threads,
-    )
-    del out
+    for op_impl in [xformers.ops.TritonFlashAttentionOp, xformers.ops.MemoryEfficientAttentionCutlassOp]:
+        out = xformers.ops.memory_efficient_attention(
+            inp.query, inp.key, inp.value, inp.attn_bias, inp.p, op=op_impl
+        )
+        grad_benchmark = torch.ones_like(q)
+        yield benchmark.Timer(
+            stmt="out.backward(grad, retain_graph=True)",
+            globals={
+                "out": out,
+                "grad": grad_benchmark,
+            },
+            label=f"attention backward (attn_bias={attn_bias_type})",
+            description=op_impl[1].NAME,
+            sub_label=sub_label,
+            num_threads=num_threads,
+        )
+        del out
 
     try:
         qkv.grad = None
