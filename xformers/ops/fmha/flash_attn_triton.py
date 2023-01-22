@@ -736,7 +736,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
 
 
 def increment_philox_state(increment: int) -> tuple:
-    torch._C._cuda_lock_mutex()
+    # torch._C._cuda_lock_mutex()
 
     # view rng_state tensor as uint64. importantly, this keeps the same underlying storage
     # we:
@@ -758,7 +758,7 @@ def increment_philox_state(increment: int) -> tuple:
 
     torch.random.set_rng_state(rng_state)
 
-    torch._C._cuda_unlock_mutex()
+    # torch._C._cuda_unlock_mutex()
 
     return seed, offset
 
