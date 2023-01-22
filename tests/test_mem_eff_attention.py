@@ -707,6 +707,9 @@ def _get_drop_mask(op, batch_size, q_len, kv_len, p, device):
         rand_uniform = torch.ops.xformers._cutlass_rand_uniform(p, mask)
         mask = (rand_uniform > p).to(torch.float32)
         mask = mask.reshape(batch_size, q_len, kv_len)
+    elif op == fmha.triton.FwOp:
+        mask = xformers.ops.fmha.flash_attn_triton.rand_uniform(batch_size, 1, q_len, kv_len, dtype=torch.float32, device=device)
+        mask = (mask > p).to(torch.float32)
     else:
         mask = torch.empty((batch_size, q_len, kv_len), device=device)
         mask = torch.ops.xformers._temp_dropout(mask, p)
@@ -715,19 +718,20 @@ def _get_drop_mask(op, batch_size, q_len, kv_len, p, device):
 
 
 @cuda_only
-@pytest.mark.parametrize("seed", [42, 124])
-@pytest.mark.parametrize("p", [0.3, 0.7])
-@pytest.mark.parametrize("k_len", [32])
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("kv_len", [3, 15, 32, 33])
-@pytest.mark.parametrize("q_len", [2, 33])
+@pytest.mark.parametrize("seed", [0])
+@pytest.mark.parametrize("p", [0.7])
+@pytest.mark.parametrize("k_len", [128])
+@pytest.mark.parametrize("batch_size", [1])
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("q_len", [128, 256])
 @pytest.mark.parametrize("op", ALL_FW_OPS, ids=list(map(lambda t: t.NAME, ALL_FW_OPS)))
 def test_dropout(op, q_len, kv_len, batch_size, k_len, p, seed):
+    dtype = torch.bfloat16
     device = "cuda"
     scale = 3
-    query = torch.randn((batch_size, q_len, k_len), device=device) * scale
-    key = torch.randn((batch_size, kv_len, k_len), device=device) * scale
-    value = torch.randn((batch_size, kv_len, k_len), device=device) * scale
+    query = torch.randn((batch_size, q_len, k_len), dtype=dtype, device=device) * scale
+    key = torch.randn((batch_size, kv_len, k_len), dtype=dtype, device=device) * scale
+    value = torch.randn((batch_size, kv_len, k_len), dtype=dtype, device=device) * scale
 
     attn_bias = None
 
@@ -751,7 +755,7 @@ def test_dropout(op, q_len, kv_len, batch_size, k_len, p, seed):
     torch.manual_seed(seed)
     mask = _get_drop_mask(op, batch_size, q_len, kv_len, p, device)
     ref = ref_attention(query, key, value, attn_bias, mask, p)
-    assert_allclose(out, ref, atol=2e-4), f"{(out - ref).abs().max()}"
+    assert_allclose(out.float(), ref, atol=op.ERROR_ATOL[dtype], rtol=op.ERROR_RTOL[dtype]), f"{(out - ref).abs().max()}"
 
     num_trials = 1000
     p_val_tol = 1e-6

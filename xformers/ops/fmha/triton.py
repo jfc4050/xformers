@@ -70,7 +70,7 @@ class FwOp(AttentionFwOpBase):
         torch.Tensor,
         LowerTriangularMaskWithTensorBias,
     }
-    SUPPORTS_DROPOUT = False
+    SUPPORTS_DROPOUT = True
     SUPPORTS_CUSTOM_SCALE = True
     NAME = "tritonflashattF"
 
@@ -102,8 +102,9 @@ class FwOp(AttentionFwOpBase):
             k=inp.key,
             v=inp.value,
             bias=inp.attn_bias,
-            softmax_scale=inp.scale_float,
             causal=causal,
+            dropout_p=inp.p,
+            softmax_scale=inp.scale_float,
         )
         return out, Context(lse=lse, out=out)
 
