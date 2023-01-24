@@ -843,6 +843,17 @@ def test_dropout_backward_flash(q_len, kv_len, batch_size, k_len, p):
         q_len, kv_len, batch_size, k_len, p, op=fmha.flash.FwOp, dtype=torch.float16
     )
 
+@sm75_or_better_only
+@pytest.mark.parametrize("p", [0.3, 0.7])
+@pytest.mark.parametrize("k_len", [16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("kv_len", [3, 15, 32, 33, 128, 256])
+@pytest.mark.parametrize("q_len", [2, 33, 128, 256])
+def test_dropout_backward_triton(q_len, kv_len, batch_size, k_len, p):
+    _test_dropout_backward(
+        q_len, kv_len, batch_size, k_len, p, op=fmha.triton.FwOp, dtype=torch.float16
+    )
+
 
 @cuda_only
 @pytest.mark.parametrize("p", [0.3, 0.7])

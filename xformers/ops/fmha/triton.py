@@ -97,7 +97,7 @@ class FwOp(AttentionFwOpBase):
         causal = isinstance(inp.attn_bias, (LowerTriangularMask, LowerTriangularMaskWithTensorBias))
         inp = _prepare_inputs(inp)
 
-        out, lse, softmax_scale = triton_flash_forward(
+        out, lse, softmax_scale, seed, rng_offset = triton_flash_forward(
             q=inp.query,
             k=inp.key,
             v=inp.value,
@@ -106,7 +106,13 @@ class FwOp(AttentionFwOpBase):
             dropout_p=inp.p,
             softmax_scale=inp.scale_float,
         )
-        return out, Context(lse=lse, out=out)
+        ctx = Context(
+            lse=lse,
+            out=out,
+            rng_state=torch.tensor([seed, rng_offset], dtype=torch.int64, device="cpu") if inp.p != 0 else None,
+            op_bw=BwOp if inp.p != 0 else None,
+        )
+        return out, ctx
 
 
 @register_operator
@@ -147,6 +153,17 @@ class BwOp(AttentionBwOpBase):
         causal = isinstance(inp.attn_bias, (LowerTriangularMask, LowerTriangularMaskWithTensorBias))
         inp = _prepare_inputs(inp)
 
+        rng_seed = rng_offset = 0
+        if inp.p != 0.0:
+            if (
+                ctx.rng_state is None
+                or ctx.rng_state.dtype != torch.int64
+                or ctx.rng_state.device.type != "cpu"
+                or ctx.rng_state.shape != (2,)
+            ):
+                raise NotImplementedError(f"Invalid rng_state: {ctx.rng_state}")
+            rng_seed, rng_offset = ctx.rng_state.tolist()
+
         # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
         # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
         with torch.inference_mode():
@@ -168,5 +185,8 @@ class BwOp(AttentionBwOpBase):
                 bias=inp.attn_bias,
                 softmax_scale=inp.scale_float,
                 causal=causal,
+                dropout_p=inp.p,
+                dropout_seed=rng_seed,
+                dropout_seq_offset=rng_offset,
             )
         return grads

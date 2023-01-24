@@ -296,9 +296,14 @@ def _bwd_kernel_one_col_block(
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
+    dropout_p: float,
+    dropout_seed: int,
+    dropout_seq_offset: int,
+    offs_hb,
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
     seqlen_q, seqlen_k, headdim,
+    USE_DROPOUT: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -403,6 +408,23 @@ def _bwd_kernel_one_col_block(
             p = tl.exp(qk * softmax_scale - lse_i[:, None])
         else:
             p = tl.exp(qk - lse_i[:, None])
+
+        zij = tl.zeros([BLOCK_M, BLOCK_N], dtype=p.dtype)
+        if USE_DROPOUT:
+            # compute Zij. has values:
+            #   1 / (1 - p) with probability 1 - p
+            #   0 with probability p
+            rng_offsets = \
+                dropout_seq_offset + \
+                offs_hb * seqlen_q * seqlen_k + \
+                (start_m + offs_m[:, None] * seqlen_k) + \
+                (start_n + offs_n[None, :])
+            dropout_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
+            zij = dropout_mask.to(p.dtype) / (1 - dropout_p)
+
+            # apply dropout to Pij
+            p *= zij
+
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
@@ -433,6 +455,7 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        dp *= zij
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
@@ -520,6 +543,9 @@ def _bwd_kernel(
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
+    dropout_p,
+    dropout_seed,
+    dropout_seq_offset,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -530,6 +556,7 @@ def _bwd_kernel(
     stride_dvb, stride_dvh, stride_dvn,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
+    USE_DROPOUT: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -562,9 +589,14 @@ def _bwd_kernel(
                 DO, DQ, DK, DV,
                 LSE, D,
                 softmax_scale,
+                dropout_p,
+                dropout_seed,
+                dropout_seq_offset,
+                off_hb,
                 stride_qm, stride_kn, stride_vn, stride_bm,
                 stride_dom, stride_dqm, stride_dkn, stride_dvn,
                 seqlen_q, seqlen_k, headdim,
+                USE_DROPOUT=USE_DROPOUT,
                 ATOMIC_ADD=False,
                 BIAS_TYPE=BIAS_TYPE,
                 IS_CAUSAL=IS_CAUSAL,
@@ -580,9 +612,14 @@ def _bwd_kernel(
             DO, DQ, DK, DV,
             LSE, D,
             softmax_scale,
+            dropout_p,
+            dropout_seed,
+            dropout_seq_offset,
+            off_hb,
             stride_qm, stride_kn, stride_vn, stride_bm,
             stride_dom, stride_dqm, stride_dkn, stride_dvn,
             seqlen_q, seqlen_k, headdim,
+            USE_DROPOUT=dropout_p > 0.0,
             ATOMIC_ADD=True,
             BIAS_TYPE=BIAS_TYPE,
             IS_CAUSAL=IS_CAUSAL,
@@ -639,8 +676,8 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         lse, tmp,
         softmax_scale,
         dropout_p,
-        int(seed),  # dropout_seed
-        int(rng_offset),  # dropout seq offset
+        seed,  # dropout_seed
+        rng_offset,  # dropout seq offset
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -656,10 +693,10 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         num_warps=num_warps,
         num_stages=1,
     )
-    return o, lse, softmax_scale  # softmax_scale could have been updated
+    return o, lse, softmax_scale, seed, rng_offset  # softmax_scale could have been updated
 
 
-def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, dropout_p=0.0, dropout_seed=None, dropout_seq_offset=None, softmax_scale=None):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
@@ -714,6 +751,9 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         do, dq_accum, dk, dv,
         lse, delta,
         softmax_scale,
+        dropout_p,
+        dropout_seed,
+        dropout_seq_offset,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -724,6 +764,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         dv.stride(0), dv.stride(2), dv.stride(1),
         nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
+        dropout_p > 0.0,
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         bias_type, causal, BLOCK_HEADDIM,
@@ -760,7 +801,7 @@ def increment_philox_state(increment: int) -> tuple:
 
     # torch._C._cuda_unlock_mutex()
 
-    return seed, offset
+    return int(seed), int(offset)
 
 
 @triton.jit
@@ -803,7 +844,7 @@ def rand_uniform(
 
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
     BLOCK = 128
-    _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, int(seed), int(rng_offset), BLOCK, BLOCK)
+    _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
 
     return tensor
 

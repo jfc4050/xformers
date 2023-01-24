@@ -17,7 +17,7 @@ import xformers.ops
 import xformers.ops.fmha as fmha
 from xformers.ops.fmha.attn_bias import LowerTriangularMaskWithTensorBias
 
-CHECK_CORRECTNESS = True
+CHECK_CORRECTNESS = False
 torch.backends.cuda.matmul.allow_tf32 = False
 
 
@@ -112,7 +112,7 @@ CASES = list(
     product_dict(
         shape=SHAPES,
         num_threads=NUM_THREADS,
-        dropout_p=[0.0],  # TODO - add this
+        dropout_p=[0.0, 0.3],  # TODO - add this
         attn_bias_cfg=[
             (torch.Tensor, False),
             (torch.Tensor, True),
@@ -324,5 +324,5 @@ def benchmark_backward(shape, num_threads: int, attn_bias_cfg, dropout_p, dtype)
         pass
 
 
-benchmark_main_helper(benchmark_forward, CASES, min_run_time=min_run_time)
+# benchmark_main_helper(benchmark_forward, CASES, min_run_time=min_run_time)
 benchmark_main_helper(benchmark_backward, CASES, min_run_time=min_run_time)
